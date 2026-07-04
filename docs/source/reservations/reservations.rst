@@ -141,7 +141,9 @@ GCP `Dynamic Workload Scheduler (DWS) <https://cloud.google.com/blog/products/co
 Using DWS for VMs
 ~~~~~~~~~~~~~~~~~
 
-SkyPilot allows you to launch resources via DWS by specifying the ``gcp.managed_instance_group`` field in ``~/.sky/config.yaml``:
+SkyPilot allows you to launch GPU VMs and supported TPU VM machine types via
+DWS Flex-start provisioning by specifying the ``gcp.managed_instance_group``
+field in ``~/.sky/config.yaml``:
 
 .. code-block:: yaml
 
@@ -151,8 +153,13 @@ SkyPilot allows you to launch resources via DWS by specifying the ``gcp.managed_
         provision_timeout: 900
 
 
-1. ``run_duration``: duration for a created instance to be kept alive (in seconds, required).
+1. ``run_duration``: duration for a created Flex-start instance to be kept
+   alive (in seconds, required). The value must be between 10 minutes and
+   7 days.
 2. ``provision_timeout``: timeout for provisioning an instance with DWS (in seconds, optional). If the timeout is reached without requested resources being provisioned, SkyPilot will automatically :ref:`failover <auto-failover>` to other clouds/regions/zones to get the resources.
+3. ``accelerator_topology`` and ``accelerator_topology_mode``: required for
+   multi-host TPU VM MIGs. SkyPilot uses them to create the GCP workload policy
+   and a bulk target-size MIG for the full TPU slice.
 
 See :ref:`config-yaml` for more details.
 
@@ -165,6 +172,8 @@ In case you want to specify the DWS configuration for each job/cluster, you can 
         managed_instance_group:
           run_duration: 3600
           provision_timeout: 900
+          accelerator_topology: 4x8
+          accelerator_topology_mode: AUTO_CONNECT
 
     resources:
       infra: gcp

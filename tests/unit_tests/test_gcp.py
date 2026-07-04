@@ -8,6 +8,8 @@ from sky import logs
 from sky import resources
 from sky import skypilot_config
 from sky.backends import backend_utils
+from sky.catalog import gcp_catalog
+from sky.clouds import gcp as gcp_cloud
 from sky.clouds import Region
 from sky.clouds import Zone
 from sky.clouds.gcp import GCP
@@ -15,8 +17,11 @@ from sky.clouds.utils import gcp_utils
 from sky.provision import common
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants as gcp_constants
+from sky.provision.gcp import instance_utils
+from sky.provision.gcp import mig_utils
 from sky.utils import common_utils
 from sky.utils import config_utils
+from sky.utils import resources_utils
 
 
 @pytest.mark.parametrize((
@@ -103,6 +108,366 @@ def test_gcp_reservation_name():
         specific_reservation_required=True,
         zone='zone')
     assert r.name == 'projects/<project>/reservations/<reservation-name>'
+
+
+def test_gcp_mig_instance_template_uses_flex_start(monkeypatch):
+    compute = MagicMock()
+    insert = compute.regionInstanceTemplates.return_value.insert
+    insert.return_value.execute.return_value = {'name': 'operation'}
+    monkeypatch.setattr(
+        mig_utils.gcp,
+        'build',
+        lambda *args, **kwargs: compute,
+    )
+
+    node_config = {
+        gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+            'run_duration': 3600,
+            'provision_timeout': 900,
+        },
+        'machineType': 'n1-standard-4',
+        'guestAccelerators': [{
+            'acceleratorType': 'nvidia-tesla-a100',
+            'acceleratorCount': 1,
+        }],
+        'scheduling': {
+            'onHostMaintenance': 'TERMINATE',
+        },
+        'reservationAffinity': {
+            'consumeReservationType': 'SPECIFIC_RESERVATION',
+        },
+    }
+
+    operation = mig_utils.create_region_instance_template(
+        'cluster', 'project', 'us-central1', 'template', node_config)
+
+    assert operation == {'name': 'operation'}
+    insert.assert_called_once()
+    body = insert.call_args.kwargs['body']
+    properties = body['properties']
+    assert gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG not in properties
+    assert properties['reservationAffinity'] == {
+        'consumeReservationType': 'NO_RESERVATION',
+    }
+    assert properties['scheduling'] == {
+        'provisioningModel': 'FLEX_START',
+        'instanceTerminationAction': 'DELETE',
+        'maxRunDuration': {
+            'seconds': '3600',
+        },
+        'onHostMaintenance': 'TERMINATE',
+    }
+
+
+def test_gcp_ct6e_machine_type_uses_mig_without_guest_accelerators():
+    assert instance_utils.get_node_type({
+        gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+            'run_duration': 3600,
+            'provision_timeout': 900,
+        },
+        'machineType': 'ct6e-standard-8t',
+    }) == instance_utils.GCPNodeType.MIG
+
+
+def test_gcp_cpu_machine_type_with_mig_config_uses_compute():
+    assert instance_utils.get_node_type({
+        gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+            'run_duration': 3600,
+            'provision_timeout': 900,
+        },
+        'machineType': 'n1-standard-4',
+    }) == instance_utils.GCPNodeType.COMPUTE
+
+
+def test_gcp_ct6e_boot_disk_uses_hyperdisk_balanced():
+    for disk_tier in (
+            None,
+            resources_utils.DiskTier.LOW,
+            resources_utils.DiskTier.MEDIUM,
+            resources_utils.DiskTier.HIGH,
+            resources_utils.DiskTier.ULTRA,
+            resources_utils.DiskTier.BEST,
+    ):
+        assert GCP._get_disk_type('ct6e-standard-4t',
+                                  disk_tier) == 'hyperdisk-balanced'
+
+
+def test_gcp_mig_resource_names_fit_gce_limit():
+    cluster_name = 'spectra-' + 'long-' * 20
+
+    for resource_name in (
+            mig_utils.get_instance_template_name(cluster_name),
+            mig_utils.get_managed_instance_group_name(cluster_name),
+            mig_utils.get_workload_policy_name(cluster_name),
+    ):
+        assert len(resource_name) <= mig_utils.GCE_RESOURCE_NAME_MAX_LENGTH
+        assert resource_name.startswith('sky-')
+
+
+def test_gcp_tpu_mig_gcloud_commands(monkeypatch):
+    commands = []
+
+    class Result:
+        stdout = ''
+        stderr = ''
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        commands.append((cmd, kwargs))
+        return Result()
+
+    monkeypatch.setattr(mig_utils.subprocess, 'run', fake_run)
+
+    mig_utils.create_workload_policy('project', 'us-east5', 'policy', '4x8',
+                                     'AUTO_CONNECT')
+    mig_utils.create_region_managed_instance_group(
+        'project',
+        'us-east5',
+        ['us-east5-a'],
+        'mig',
+        'projects/project/regions/us-east5/instanceTemplates/template',
+        8,
+        'projects/project/regions/us-east5/resourcePolicies/policy',
+    )
+
+    assert commands[0][0] == [
+        'gcloud',
+        '--project',
+        'project',
+        'compute',
+        'resource-policies',
+        'create',
+        'workload-policy',
+        'policy',
+        '--type',
+        'HIGH_THROUGHPUT',
+        '--accelerator-topology',
+        '4x8',
+        '--accelerator-topology-mode',
+        'AUTO_CONNECT',
+        '--region',
+        'us-east5',
+        '--quiet',
+    ]
+    assert commands[1][0] == [
+        'gcloud',
+        '--project',
+        'project',
+        'compute',
+        'instance-groups',
+        'managed',
+        'create',
+        'mig',
+        '--size',
+        '8',
+        '--target-size-policy-mode',
+        'bulk',
+        '--template',
+        'projects/project/regions/us-east5/instanceTemplates/template',
+        '--region',
+        'us-east5',
+        '--zones',
+        'us-east5-a',
+        '--default-action-on-vm-failure',
+        'do-nothing',
+        '--workload-policy',
+        'projects/project/regions/us-east5/resourcePolicies/policy',
+        '--target-distribution-shape',
+        'any-single-zone',
+        '--instance-redistribution-type',
+        'none',
+        '--quiet',
+    ]
+    for _, kwargs in commands:
+        assert kwargs['stdout'] == mig_utils.subprocess.PIPE
+        assert kwargs['stderr'] == mig_utils.subprocess.PIPE
+        assert kwargs['text'] is True
+        assert kwargs['check'] is False
+
+
+def test_gcp_ct6e_mig_uses_regional_bulk_workload_policy(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mig_utils, 'check_instance_template_exits',
+                        lambda *args, **kwargs: False)
+    monkeypatch.setattr(mig_utils, 'check_region_managed_instance_group_exists',
+                        lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        mig_utils, 'check_managed_instance_group_exists',
+        lambda *args, **kwargs:
+        (_ for _ in
+         ()).throw(AssertionError('TPU MIG should not use zonal MIG lookup')))
+    monkeypatch.setattr(mig_utils, 'check_workload_policy_exists',
+                        lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        mig_utils, 'create_region_instance_template',
+        lambda *args, **kwargs: calls.append(
+            ('template', args, kwargs)) or {'name': 'template-op'})
+    monkeypatch.setattr(
+        mig_utils, 'create_workload_policy',
+        lambda *args, **kwargs: calls.append(('workload-policy', args, kwargs)))
+    monkeypatch.setattr(
+        mig_utils, 'create_region_managed_instance_group',
+        lambda *args, **kwargs: calls.append(('regional-mig', args, kwargs)))
+    monkeypatch.setattr(
+        mig_utils, 'wait_for_region_managed_group_to_be_stable',
+        lambda *args, **kwargs: calls.append(
+            ('wait-regional-mig', args, kwargs)))
+    monkeypatch.setattr(
+        mig_utils, 'create_managed_instance_group', lambda *args, **kwargs:
+        (_ for _ in
+         ()).throw(AssertionError('TPU MIG should not use zonal MIG creation')))
+    monkeypatch.setattr(
+        mig_utils, 'resize_managed_instance_group', lambda *args, **kwargs:
+        (_ for _ in
+         ()).throw(AssertionError('TPU MIG should not use resize requests')))
+    monkeypatch.setattr(
+        instance_utils.GCPManagedInstanceGroup, 'wait_for_operation',
+        classmethod(lambda cls, *args, **kwargs: calls.append(
+            ('wait-operation', args, kwargs))))
+    monkeypatch.setattr(
+        instance_utils.GCPManagedInstanceGroup, '_add_labels_and_find_head',
+        classmethod(lambda cls, *args, **kwargs: ['node-0', 'node-1']))
+    monkeypatch.setattr(
+        instance_utils.GCPManagedInstanceGroup, 'create_node_tag',
+        classmethod(lambda cls, *args, **kwargs: calls.append(
+            ('head-tag', args, kwargs))))
+
+    _, instance_names = instance_utils.GCPManagedInstanceGroup.create_instances(
+        cluster_name='cluster',
+        project_id='project',
+        zone='us-east5-a',
+        node_config={
+            gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+                'run_duration': 3600,
+                'provision_timeout': 900,
+                'accelerator_topology': '4x8',
+                'accelerator_topology_mode': 'AUTO_CONNECT',
+            },
+            'machineType': 'ct6e-standard-4t',
+            'labels': {},
+        },
+        labels={},
+        count=2,
+        total_count=2,
+        include_head_node=True,
+    )
+
+    assert instance_names == ['node-0', 'node-1']
+    assert [call[0] for call in calls] == [
+        'template',
+        'wait-operation',
+        'workload-policy',
+        'regional-mig',
+        'wait-regional-mig',
+        'head-tag',
+    ]
+    regional_mig_call = calls[3]
+    assert regional_mig_call[2] == {
+        'size': 2,
+        'workload_policy_url':
+            'projects/project/regions/us-east5/resourcePolicies/'
+            'sky-wp-cluster',
+    }
+    assert regional_mig_call[1][:5] == (
+        'project',
+        'us-east5',
+        ['us-east5-a'],
+        'sky-mig-cluster',
+        'projects/project/regions/us-east5/instanceTemplates/sky-it-cluster',
+    )
+
+
+def test_gcp_ct6e_mig_requires_accelerator_topology(monkeypatch):
+    monkeypatch.setattr(mig_utils, 'check_instance_template_exits',
+                        lambda *args, **kwargs: True)
+    monkeypatch.setattr(mig_utils, 'check_region_managed_instance_group_exists',
+                        lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        instance_utils.GCPManagedInstanceGroup, 'filter',
+        classmethod(lambda cls, *args, **kwargs: {'node-0': {}}))
+
+    with pytest.raises(common.ProvisionerError, match='accelerator_topology'):
+        instance_utils.GCPManagedInstanceGroup.create_instances(
+            cluster_name='cluster',
+            project_id='project',
+            zone='us-east5-a',
+            node_config={
+                gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+                    'run_duration': 3600,
+                },
+                'machineType': 'ct6e-standard-4t',
+                'labels': {},
+            },
+            labels={},
+            count=1,
+            total_count=1,
+            include_head_node=True,
+        )
+
+
+def test_gcp_ct6e_catalog_entries_are_launchable_in_us_east5():
+    assert gcp_catalog.instance_type_exists('ct6e-standard-8t') is True
+    assert gcp_catalog.get_vcpus_mem_from_instance_type('ct6e-standard-8t') == (
+        360, 1440)
+
+    regions = gcp_catalog.get_region_zones_for_instance_type('ct6e-standard-8t',
+                                                             use_spot=False)
+
+    assert [region.name for region in regions] == ['us-east5']
+    assert [zone.name for zone in regions[0].zones] == [
+        'us-east5-a',
+        'us-east5-b',
+        'us-east5-c',
+    ]
+
+
+def test_gcp_ct6e_catalog_uses_tpu_v6e_price(monkeypatch):
+    calls = []
+
+    def mock_accelerator_hourly_cost(accelerator,
+                                     count,
+                                     use_spot=False,
+                                     region=None,
+                                     zone=None):
+        calls.append((accelerator, count, use_spot, region, zone))
+        return 42.0
+
+    monkeypatch.setattr(gcp_catalog, 'get_accelerator_hourly_cost',
+                        mock_accelerator_hourly_cost)
+
+    assert gcp_catalog.get_hourly_cost('ct6e-standard-8t',
+                                       use_spot=False,
+                                       region='us-east5',
+                                       zone='us-east5-a') == 42.0
+    assert calls == [('tpu-v6e-8', 1, False, 'us-east5', 'us-east5-a')]
+
+
+def test_gcp_ct6e_spot_is_not_launchable():
+    assert gcp_catalog.get_region_zones_for_instance_type('ct6e-standard-8t',
+                                                          use_spot=True) == []
+    with pytest.raises(ValueError, match='do not support spot'):
+        gcp_catalog.get_hourly_cost('ct6e-standard-8t', use_spot=True)
+
+
+def test_gcp_check_quota_skips_for_managed_instance_group(monkeypatch):
+    """DWS/Flex-start should not be blocked by on-demand quota precheck."""
+    resources_obj = resources.Resources(cloud=GCP(),
+                                        region='us-central1',
+                                        accelerators={'A100-80GB': 1})
+    monkeypatch.setattr(
+        skypilot_config,
+        'get_effective_region_config',
+        lambda *args, **kwargs: {
+            'run_duration': 600,
+        },
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError('Quota subprocess should not be called for DWS.')
+
+    monkeypatch.setattr(gcp_cloud.subprocess_utils, 'run', fail_if_called)
+
+    assert GCP.check_quota_available(resources_obj) is True
 
 
 @pytest.mark.parametrize(

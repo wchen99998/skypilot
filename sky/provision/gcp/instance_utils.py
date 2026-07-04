@@ -1076,11 +1076,16 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
             cluster_name)
         managed_instance_group_name = mig_utils.get_managed_instance_group_name(
             cluster_name)
+        use_tpu_mig = mig_utils.is_tpu_managed_instance_group(config)
 
         instance_template_exists = mig_utils.check_instance_template_exits(
             project_id, region, instance_template_name)
-        mig_exists = mig_utils.check_managed_instance_group_exists(
-            project_id, zone, managed_instance_group_name)
+        if use_tpu_mig:
+            mig_exists = mig_utils.check_region_managed_instance_group_exists(
+                project_id, region, managed_instance_group_name)
+        else:
+            mig_exists = mig_utils.check_managed_instance_group_exists(
+                project_id, zone, managed_instance_group_name)
 
         label_filters = {
             provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name,
@@ -1127,6 +1132,60 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
         # create managed instance group
         instance_template_url = (f'projects/{project_id}/regions/{region}/'
                                  f'instanceTemplates/{instance_template_name}')
+        managed_instance_group_config = config[
+            constants.MANAGED_INSTANCE_GROUP_CONFIG]
+        if use_tpu_mig:
+            if count not in (0, total_count):
+                raise common.ProvisionerError(
+                    'TPU DWS MIG requires creating the full accelerator '
+                    f'topology at once. Got count={count}, '
+                    f'total_count={total_count}.')
+            accelerator_topology = managed_instance_group_config.get(
+                'accelerator_topology')
+            if accelerator_topology is None:
+                raise common.ProvisionerError(
+                    'TPU DWS MIG requires '
+                    'gcp.managed_instance_group.accelerator_topology.')
+            accelerator_topology_mode = managed_instance_group_config.get(
+                'accelerator_topology_mode',
+                mig_utils.TPU_MIG_DEFAULT_ACCELERATOR_TOPOLOGY_MODE)
+            workload_policy_name = mig_utils.get_workload_policy_name(
+                cluster_name)
+            if not mig_utils.check_workload_policy_exists(
+                    project_id, region, workload_policy_name):
+                mig_utils.create_workload_policy(project_id, region,
+                                                 workload_policy_name,
+                                                 accelerator_topology,
+                                                 accelerator_topology_mode)
+            if not mig_exists:
+                mig_utils.create_region_managed_instance_group(
+                    project_id,
+                    region, [zone],
+                    managed_instance_group_name,
+                    instance_template_url,
+                    size=total_count,
+                    workload_policy_url=mig_utils.get_workload_policy_url(
+                        project_id, region, workload_policy_name))
+            mig_utils.wait_for_region_managed_group_to_be_stable(
+                project_id,
+                region,
+                managed_instance_group_name,
+                timeout=managed_instance_group_config.get(
+                    'provision_timeout',
+                    constants.DEFAULT_MANAGED_INSTANCE_GROUP_PROVISION_TIMEOUT))
+            pending_running_instance_names = cls._add_labels_and_find_head(
+                cluster_name, project_id, zone, labels,
+                potential_head_instances)
+            assert len(pending_running_instance_names) == total_count, (
+                pending_running_instance_names, total_count)
+            cls.create_node_tag(
+                project_id,
+                zone,
+                pending_running_instance_names[0],
+                is_head=True,
+            )
+            return None, pending_running_instance_names
+
         if not mig_exists:
             # Create a new MIG with size 0 and resize it later for triggering
             # DWS, according to the doc: https://cloud.google.com/compute/docs/instance-groups/create-mig-with-gpu-vms # pylint: disable=line-too-long
@@ -1138,8 +1197,6 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                 size=0)
             cls.wait_for_operation(operation, project_id, zone=zone)
 
-        managed_instance_group_config = config[
-            constants.MANAGED_INSTANCE_GROUP_CONFIG]
         if count > 0:
             # Use resize to trigger DWS for creating VMs.
             operation = mig_utils.resize_managed_instance_group(
@@ -1196,7 +1253,30 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
     def delete_mig(cls, project_id: str, zone: str, cluster_name: str) -> bool:
         """Returns whether the MIG is deleted successfully."""
         mig_exists_and_deleted = True
+        region = zone.rpartition('-')[0]
         mig_name = mig_utils.get_managed_instance_group_name(cluster_name)
+        if mig_utils.check_region_managed_instance_group_exists(
+                project_id, region, mig_name):
+            logger.debug(f'Deleting regional MIG {mig_name!r} ...')
+            try:
+                operation = mig_utils.delete_region_managed_instance_group(
+                    project_id, region, mig_name)
+                cls.wait_for_operation(operation, project_id, region=region)
+            except gcp.http_error_exception() as e:
+                if re.search(mig_utils.REGION_MIG_RESOURCE_NOT_FOUND_PATTERN,
+                             str(e)) is None:
+                    raise
+                logger.debug(f'Regional MIG {mig_name!r} does not exist. '
+                             'Skip deletion.')
+                mig_exists_and_deleted = False
+            cls._delete_instance_template(
+                project_id, zone,
+                mig_utils.get_instance_template_name(cluster_name))
+            mig_utils.delete_workload_policy(
+                project_id, region,
+                mig_utils.get_workload_policy_name(cluster_name))
+            return mig_exists_and_deleted
+
         # Get all resize request of the MIG and cancel them.
         mig_utils.cancel_all_resize_request_for_mig(project_id, zone, mig_name)
         logger.debug(f'Deleting MIG {mig_name!r} ...')
@@ -1905,13 +1985,14 @@ def get_node_type(config: Dict[str, Any]) -> GCPNodeType:
             'is required. '
             f'Got {list(config)}')
 
+    if (config.get(constants.MANAGED_INSTANCE_GROUP_CONFIG,
+                   None) is not None and 'machineType' in config and
+        (config.get('guestAccelerators', None) is not None or
+         mig_utils.is_ct6e_machine_type(config['machineType']))):
+        return GCPNodeType.MIG
+
     if 'machineType' not in config and 'acceleratorType' in config:
         return GCPNodeType.TPU
-
-    if (config.get(constants.MANAGED_INSTANCE_GROUP_CONFIG, None) is not None
-            and config.get('guestAccelerators', None) is not None):
-        # DWS in MIG only works for machine with GPUs.
-        return GCPNodeType.MIG
 
     return GCPNodeType.COMPUTE
 

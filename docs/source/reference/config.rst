@@ -1294,19 +1294,26 @@ Example:
 Managed instance group / DWS (optional).
 
 SkyPilot supports launching instances in a managed instance group (MIG)
-which schedules the GPU instance creation through DWS, offering a better
-availability. This feature is only applied when a resource request
-contains GPU instances.
+with Flex-start provisioning through DWS, offering a better availability.
+This feature is applied when a resource request contains GPU instances or
+GCP TPU VM machine types that support Flex-start MIGs.
 
 ``run_duration``: Duration for a created instance to be kept alive (in seconds, required).
-This is required for the DWS to work properly. After the specified duration,
-the instance will be terminated.
+This is required for DWS Flex-start provisioning to work properly. After the
+specified duration, the instance will be terminated. The value must be between
+``600`` (10 minutes) and ``604800`` (7 days).
 
 ``provision_timeout``: Timeout for provisioning an instance by DWS (in seconds, optional).
 This timeout determines how long SkyPilot will wait for a managed instance
 group to create the requested resources before giving up, deleting the MIG
 and failing over to other locations. Larger timeouts may increase the chance
 for getting a resource, but will block failover to go to other zones/regions/clouds.
+
+``accelerator_topology``: Accelerator topology for GCP TPU VM MIGs, such as
+``4x8``. SkyPilot uses this to create the TPU workload policy required by GCP.
+
+``accelerator_topology_mode``: Accelerator topology mode for GCP TPU VM MIGs.
+Defaults to ``AUTO_CONNECT`` when omitted.
 
 Default: ``900``.
 
@@ -1318,6 +1325,8 @@ Example:
     managed_instance_group:
       run_duration: 3600
       provision_timeout: 900
+      accelerator_topology: 4x8
+      accelerator_topology_mode: AUTO_CONNECT
 
 .. _config-yaml-gcp-remote-identity:
 

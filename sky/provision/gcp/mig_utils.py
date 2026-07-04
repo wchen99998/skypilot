@@ -1,7 +1,8 @@
 """Managed Instance Group Utils"""
+import hashlib
 import re
 import subprocess
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from sky import sky_logging
 from sky.adaptors import gcp
@@ -13,17 +14,62 @@ MIG_RESOURCE_NOT_FOUND_PATTERN = re.compile(
     r'The resource \'projects/.*/zones/.*/instanceGroupManagers/.*\' was not '
     r'found')
 
+REGION_MIG_RESOURCE_NOT_FOUND_PATTERN = re.compile(
+    r'The resource \'projects/.*/regions/.*/instanceGroupManagers/.*\' was '
+    r'not found')
+
 IT_RESOURCE_NOT_FOUND_PATTERN = re.compile(
     r'The resource \'projects/.*/regions/.*/instanceTemplates/.*\' was not '
     'found')
 
+WORKLOAD_POLICY_RESOURCE_NOT_FOUND_PATTERN = re.compile(
+    r'The resource \'projects/.*/regions/.*/resourcePolicies/.*\' was not '
+    'found')
+
+GCE_RESOURCE_NAME_MAX_LENGTH = 63
+CT6E_MACHINE_TYPE_PREFIX = 'ct6e-standard-'
+TPU_MIG_DEFAULT_ACCELERATOR_TOPOLOGY_MODE = 'AUTO_CONNECT'
+TPU_MIG_WORKLOAD_POLICY_TYPE = 'HIGH_THROUGHPUT'
+
+
+def _prefixed_resource_name(prefix: str, cluster_name: str) -> str:
+    name = f'{prefix}{cluster_name}'
+    if len(name) <= GCE_RESOURCE_NAME_MAX_LENGTH:
+        return name
+    digest = hashlib.sha1(cluster_name.encode()).hexdigest()[:8]
+    base_length = GCE_RESOURCE_NAME_MAX_LENGTH - len(prefix) - len(digest) - 1
+    base = cluster_name[:base_length].rstrip('-')
+    return f'{prefix}{base}-{digest}'
+
 
 def get_instance_template_name(cluster_name: str) -> str:
-    return f'{constants.INSTANCE_TEMPLATE_NAME_PREFIX}{cluster_name}'
+    return _prefixed_resource_name(constants.INSTANCE_TEMPLATE_NAME_PREFIX,
+                                   cluster_name)
 
 
 def get_managed_instance_group_name(cluster_name: str) -> str:
-    return f'{constants.MIG_NAME_PREFIX}{cluster_name}'
+    return _prefixed_resource_name(constants.MIG_NAME_PREFIX, cluster_name)
+
+
+def get_workload_policy_name(cluster_name: str) -> str:
+    return _prefixed_resource_name(constants.WORKLOAD_POLICY_NAME_PREFIX,
+                                   cluster_name)
+
+
+def get_workload_policy_url(project_id: str, region: str,
+                            policy_name: str) -> str:
+    return (f'projects/{project_id}/regions/{region}/resourcePolicies/'
+            f'{policy_name}')
+
+
+def is_ct6e_machine_type(machine_type: str) -> bool:
+    return machine_type.startswith(CT6E_MACHINE_TYPE_PREFIX)
+
+
+def is_tpu_managed_instance_group(node_config: Dict[str, Any]) -> bool:
+    return (node_config.get(constants.MANAGED_INSTANCE_GROUP_CONFIG)
+            is not None and is_ct6e_machine_type(
+                node_config.get('machineType', '')))
 
 
 def check_instance_template_exits(project_id: str, region: str,
@@ -54,15 +100,31 @@ def create_region_instance_template(cluster_name_on_cloud: str, project_id: str,
                         credentials=None,
                         cache_discovery=False)
     config = node_config.copy()
-    config.pop(constants.MANAGED_INSTANCE_GROUP_CONFIG, None)
+    managed_instance_group_config = config.pop(
+        constants.MANAGED_INSTANCE_GROUP_CONFIG, None)
+    assert managed_instance_group_config is not None, (
+        'Managed instance group config is required for DWS.')
 
-    # We have to ignore user defined scheduling for DWS.
-    # TODO: Add a warning log for this behvaiour.
     scheduling = config.get('scheduling', {})
     assert scheduling.get('provisioningModel') != 'SPOT', (
         'DWS does not support spot VMs.')
+    if scheduling:
+        logger.warning(
+            f'Ignoring scheduling {scheduling} for DWS. DWS requires '
+            'Flex-start scheduling.')
+    config['scheduling'] = {
+        'provisioningModel': 'FLEX_START',
+        'instanceTerminationAction': 'DELETE',
+        'maxRunDuration': {
+            'seconds': str(managed_instance_group_config['run_duration']),
+        },
+        'onHostMaintenance': 'TERMINATE',
+    }
 
-    reservations_affinity = config.pop('reservation_affinity', None)
+    reservations_affinity = config.pop('reservationAffinity', None)
+    legacy_reservations_affinity = config.pop('reservation_affinity', None)
+    if reservations_affinity is None:
+        reservations_affinity = legacy_reservations_affinity
     if reservations_affinity is not None:
         logger.warning(
             f'Ignoring reservations_affinity {reservations_affinity} '
@@ -84,6 +146,123 @@ def create_region_instance_template(cluster_name_on_cloud: str, project_id: str,
             )
         }).execute()
     return operation
+
+
+def check_workload_policy_exists(project_id: str, region: str,
+                                 policy_name: str) -> bool:
+    compute = gcp.build('compute',
+                        'v1',
+                        credentials=None,
+                        cache_discovery=False)
+    try:
+        compute.resourcePolicies().get(project=project_id,
+                                       region=region,
+                                       resourcePolicy=policy_name).execute()
+    except gcp.http_error_exception() as e:
+        if WORKLOAD_POLICY_RESOURCE_NOT_FOUND_PATTERN.search(str(e)) is not None:
+            return False
+        raise
+    return True
+
+
+def _run_gcloud(cmd: List[str]) -> None:
+    logger.info('Running command: %s', ' '.join(cmd))
+    proc = subprocess.run(cmd,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          text=True,
+                          check=False)
+    if proc.stdout:
+        logger.info(proc.stdout)
+    if proc.returncode != 0:
+        if proc.stderr:
+            logger.error(proc.stderr)
+        raise subprocess.CalledProcessError(proc.returncode,
+                                            cmd,
+                                            output=proc.stdout,
+                                            stderr=proc.stderr)
+
+
+def create_workload_policy(project_id: str, region: str, policy_name: str,
+                           accelerator_topology: str,
+                           accelerator_topology_mode: str) -> None:
+    logger.debug(f'Creating workload policy {policy_name!r}.')
+    _run_gcloud([
+        'gcloud',
+        '--project',
+        project_id,
+        'compute',
+        'resource-policies',
+        'create',
+        'workload-policy',
+        policy_name,
+        '--type',
+        TPU_MIG_WORKLOAD_POLICY_TYPE,
+        '--accelerator-topology',
+        accelerator_topology,
+        '--accelerator-topology-mode',
+        accelerator_topology_mode,
+        '--region',
+        region,
+        '--quiet',
+    ])
+
+
+def delete_workload_policy(project_id: str, region: str,
+                           policy_name: str) -> None:
+    logger.debug(f'Deleting workload policy {policy_name!r}.')
+    try:
+        compute = gcp.build('compute',
+                            'v1',
+                            credentials=None,
+                            cache_discovery=False)
+        operation = compute.resourcePolicies().delete(
+            project=project_id, region=region,
+            resourcePolicy=policy_name).execute()
+        compute.regionOperations().wait(project=project_id,
+                                        region=region,
+                                        operation=operation['name']).execute()
+    except gcp.http_error_exception() as e:
+        if WORKLOAD_POLICY_RESOURCE_NOT_FOUND_PATTERN.search(str(e)) is None:
+            raise
+        logger.debug(f'Workload policy {policy_name!r} does not exist. Skip '
+                     'deletion.')
+
+
+def create_region_managed_instance_group(project_id: str, region: str,
+                                         zones: List[str], group_name: str,
+                                         instance_template_url: str, size: int,
+                                         workload_policy_url: str) -> None:
+    logger.debug(f'Creating regional managed instance group {group_name!r}.')
+    _run_gcloud([
+        'gcloud',
+        '--project',
+        project_id,
+        'compute',
+        'instance-groups',
+        'managed',
+        'create',
+        group_name,
+        '--size',
+        str(size),
+        '--target-size-policy-mode',
+        'bulk',
+        '--template',
+        instance_template_url,
+        '--region',
+        region,
+        '--zones',
+        ','.join(zones),
+        '--default-action-on-vm-failure',
+        'do-nothing',
+        '--workload-policy',
+        workload_policy_url,
+        '--target-distribution-shape',
+        'any-single-zone',
+        '--instance-redistribution-type',
+        'none',
+        '--quiet',
+    ])
 
 
 def create_managed_instance_group(project_id: str, zone: str, group_name: str,
@@ -127,7 +306,7 @@ def resize_managed_instance_group(project_id: str, zone: str, group_name: str,
             'name': group_name,
             'resizeBy': resize_by,
             'requestedRunDuration': {
-                'seconds': run_duration,
+                'seconds': str(run_duration),
             }
         }).execute()
     return operation
@@ -181,6 +360,37 @@ def check_managed_instance_group_exists(project_id: str, zone: str,
     return True
 
 
+def check_region_managed_instance_group_exists(project_id: str, region: str,
+                                               group_name: str) -> bool:
+    compute = gcp.build('compute',
+                        'v1',
+                        credentials=None,
+                        cache_discovery=False)
+    try:
+        compute.regionInstanceGroupManagers().get(
+            project=project_id, region=region,
+            instanceGroupManager=group_name).execute()
+    except gcp.http_error_exception() as e:
+        if REGION_MIG_RESOURCE_NOT_FOUND_PATTERN.search(str(e)) is not None:
+            return False
+        raise
+    return True
+
+
+def delete_region_managed_instance_group(project_id: str, region: str,
+                                         group_name: str) -> dict:
+    logger.debug(f'Deleting regional managed instance group {group_name!r}.')
+    compute = gcp.build('compute',
+                        'v1',
+                        credentials=None,
+                        cache_discovery=False)
+    operation = compute.regionInstanceGroupManagers().delete(
+        project=project_id,
+        region=region,
+        instanceGroupManager=group_name).execute()
+    return operation
+
+
 def wait_for_managed_group_to_be_stable(project_id: str, zone: str,
                                         group_name: str, timeout: int) -> None:
     """Wait until the managed instance group is stable."""
@@ -191,6 +401,36 @@ def wait_for_managed_group_to_be_stable(project_id: str, zone: str,
                f'{group_name} '
                '--stable '
                f'--zone={zone} '
+               f'--project={project_id} '
+               f'--timeout={timeout}')
+        logger.info(
+            f'Waiting for MIG {group_name} to be stable with command:\n{cmd}')
+        proc = subprocess.run(
+            f'yes | {cmd}',
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            check=True,
+        )
+        stdout = proc.stdout.decode('ascii')
+        logger.info(stdout)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode('ascii')
+        logger.info(stderr)
+        raise
+
+
+def wait_for_region_managed_group_to_be_stable(project_id: str, region: str,
+                                               group_name: str,
+                                               timeout: int) -> None:
+    """Wait until the regional managed instance group is stable."""
+    logger.debug(f'Waiting for regional MIG {group_name} to be stable with '
+                 f'timeout {timeout}.')
+    try:
+        cmd = ('gcloud compute instance-groups managed wait-until '
+               f'{group_name} '
+               '--stable '
+               f'--region={region} '
                f'--project={project_id} '
                f'--timeout={timeout}')
         logger.info(

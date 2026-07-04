@@ -10,6 +10,7 @@ from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.catalog import common
+from sky.clouds import cloud as cloud_lib
 from sky.clouds import GCP
 from sky.utils import resources_utils
 from sky.utils import ux_utils
@@ -140,6 +141,59 @@ _INSTANCE_TYPE_TO_ACC = {
 }
 GCP_ACC_INSTANCE_TYPES = list(_INSTANCE_TYPE_TO_ACC.keys())
 
+_CT6E_TPU_VM_SPECS = {
+    'ct6e-standard-1t': (44, 176, 1),
+    'ct6e-standard-1t-tpu': (44, 176, 1),
+    'ct6e-standard-4t': (180, 720, 4),
+    'ct6e-standard-4t-tpu': (180, 720, 4),
+    'ct6e-standard-8t': (360, 1440, 8),
+    'ct6e-standard-8t-tpu': (360, 1440, 8),
+}
+_CT6E_REGION_TO_ZONES = {
+    'us-east5': ('us-east5-a', 'us-east5-b', 'us-east5-c'),
+}
+
+
+def _get_ct6e_tpu_accelerator(instance_type: str) -> Tuple[str, int]:
+    _, _, chips = _CT6E_TPU_VM_SPECS[instance_type]
+    return f'tpu-v6e-{chips}', 1
+
+
+def _get_ct6e_hourly_cost(instance_type: str, use_spot: bool,
+                          region: Optional[str], zone: Optional[str]) -> float:
+    if use_spot:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError('CT6e TPU VMs do not support spot instances.')
+
+    if zone is not None:
+        zone_region = zone.rpartition('-')[0]
+        if region is not None and region != zone_region:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(f'Zone {zone!r} is not in region {region!r}.')
+        region = zone_region
+
+    if region is not None:
+        if (region not in _CT6E_REGION_TO_ZONES or
+                zone is not None and zone not in _CT6E_REGION_TO_ZONES[region]):
+            region_or_zone = f'zone {zone!r}' if zone is not None else (
+                f'region {region!r}')
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(f'Instance type {instance_type!r} not found '
+                                 f'in {region_or_zone}.')
+        accelerator, count = _get_ct6e_tpu_accelerator(instance_type)
+        return get_accelerator_hourly_cost(accelerator,
+                                           count,
+                                           use_spot=False,
+                                           region=region,
+                                           zone=zone)
+
+    accelerator, count = _get_ct6e_tpu_accelerator(instance_type)
+    return min(
+        get_accelerator_hourly_cost(
+            accelerator, count, use_spot=False, region=ct6e_region)
+        for ct6e_region in _CT6E_REGION_TO_ZONES)
+
+
 # Number of CPU cores per GPU based on the AWS setting.
 # GCP A100 has its own instance type mapping.
 # Refer to sky/clouds/catalog/gcp_catalog.py
@@ -254,6 +308,8 @@ def instance_type_exists(instance_type: str) -> bool:
     """Check the existence of the instance type."""
     if instance_type == 'TPU-VM':
         return True
+    if instance_type in _CT6E_TPU_VM_SPECS:
+        return True
     return common.instance_type_exists_impl(_df, instance_type)
 
 
@@ -266,6 +322,8 @@ def get_hourly_cost(
     if instance_type == 'TPU-VM':
         # Currently the host VM of TPU does not cost extra.
         return 0
+    if instance_type in _CT6E_TPU_VM_SPECS:
+        return _get_ct6e_hourly_cost(instance_type, use_spot, region, zone)
     return common.get_hourly_cost_impl(_df, instance_type, use_spot, region,
                                        zone)
 
@@ -276,6 +334,9 @@ def get_vcpus_mem_from_instance_type(
     # officially documented.
     if instance_type == 'TPU-VM':
         return None, None
+    if instance_type in _CT6E_TPU_VM_SPECS:
+        vcpus, memory_gib, _ = _CT6E_TPU_VM_SPECS[instance_type]
+        return vcpus, memory_gib
     return common.get_vcpus_mem_from_instance_type_impl(_df, instance_type)
 
 
@@ -401,6 +462,15 @@ def validate_region_zone(
 
 def get_region_zones_for_instance_type(instance_type: str,
                                        use_spot: bool) -> List['cloud.Region']:
+    if instance_type in _CT6E_TPU_VM_SPECS:
+        if use_spot:
+            return []
+        return [
+            cloud_lib.Region(region).set_zones(
+                [cloud_lib.Zone(zone)
+                 for zone in zones])
+            for region, zones in _CT6E_REGION_TO_ZONES.items()
+        ]
     df = _df[_df['InstanceType'] == instance_type]
     return common.get_region_zones(df, use_spot)
 

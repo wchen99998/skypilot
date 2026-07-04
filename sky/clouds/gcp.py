@@ -70,11 +70,14 @@ _GCLOUD_INSTALLATION_LOG = '~/.sky/logs/gcloud_installation.log'
 # (OpenSSL.crypto.sign was removed in pyOpenSSL 24.3.0).
 # https://cloud.google.com/sdk/docs/release-notes#56700_2026-05-05
 _GCLOUD_VERSION = '567.0.0'
-# Need to be run with /bin/bash
+# Need to be run with /bin/bash. GCP base images may have an apt/snap-managed
+# gcloud that is too old for Compute Engine workload policies, so check the
+# specific subcommand SkyPilot needs for CT6e MIG provisioning instead of only
+# checking whether any gcloud binary exists.
 # We factor out the installation logic to keep it align in both spot
 # controller and cloud stores.
 GOOGLE_SDK_INSTALLATION_COMMAND: str = f'pushd /tmp &>/dev/null && \
-    {{ gcloud --help > /dev/null 2>&1 || \
+    {{ gcloud compute resource-policies create workload-policy --help > /dev/null 2>&1 || \
     {{ mkdir -p {os.path.dirname(_GCLOUD_INSTALLATION_LOG)} && \
     ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then \
@@ -93,8 +96,10 @@ GOOGLE_SDK_INSTALLATION_COMMAND: str = f'pushd /tmp &>/dev/null && \
     rm -rf ~/google-cloud-sdk >> {_GCLOUD_INSTALLATION_LOG}  && \
     mv google-cloud-sdk ~/ && \
     ~/google-cloud-sdk/install.sh -q >> {_GCLOUD_INSTALLATION_LOG} 2>&1 && \
-    echo "source ~/google-cloud-sdk/path.bash.inc > /dev/null 2>&1" >> ~/.bashrc && \
-    source ~/google-cloud-sdk/path.bash.inc >> {_GCLOUD_INSTALLATION_LOG} 2>&1; }}; }} && \
+    mkdir -p ~/.local/bin >> {_GCLOUD_INSTALLATION_LOG} 2>&1 && \
+    ln -sf ~/google-cloud-sdk/bin/gcloud ~/.local/bin/gcloud >> {_GCLOUD_INSTALLATION_LOG} 2>&1 && \
+    echo "export PATH=\\\"\\$HOME/.local/bin:\\$HOME/google-cloud-sdk/bin:\\$PATH\\\"" >> ~/.bashrc && \
+    export PATH="$HOME/.local/bin:$HOME/google-cloud-sdk/bin:$PATH"; }}; }} && \
     popd &>/dev/null'
 
 # TODO(zhwu): Move the default AMI size to the catalog instead.
@@ -1239,6 +1244,10 @@ class GCP(clouds.Cloud):
         if instance_type.startswith('a3-ultragpu') or series in ('n4', 'a4'):
             # a3-ultragpu, n4, and a4 instances only support hyperdisk-balanced.
             _propagate_disk_type(all='hyperdisk-balanced')
+        if series == 'ct6e':
+            # CT6e TPU VMs reject persistent disk boot disk types such as
+            # pd-balanced.
+            _propagate_disk_type(all='hyperdisk-balanced')
 
         # Series specific handling
         if series == 'n2':
@@ -1399,6 +1408,24 @@ class GCP(clouds.Cloud):
         accelerator = list(resources.accelerators.keys())[0]
         use_spot = resources.use_spot
         region = resources.region
+        managed_instance_group_config = (
+            skypilot_config.get_effective_region_config(
+                cloud='gcp',
+                region=region,
+                keys=('managed_instance_group',),
+                default_value=None,
+                override_configs=resources.cluster_config_overrides))
+        if managed_instance_group_config is not None:
+            # Flex-start VMs use DWS. GCP documents that these requests consume
+            # preemptible quota once a project has requested preemptible quota;
+            # projects that have never requested preemptible quota may consume
+            # standard quota instead. Avoid incorrectly failing early on the
+            # on-demand quota check and let the DWS provisioning request handle
+            # quota/capacity.
+            logger.warning(
+                'Skipping GCP quota precheck for DWS/Flex-start. The DWS '
+                'provisioning request will validate quota and capacity.')
+            return True
 
         # pylint: disable=import-outside-toplevel
         from sky.catalog import gcp_catalog
