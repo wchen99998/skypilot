@@ -554,6 +554,7 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
     ('kubernetes', 'set_pod_resource_limits'),
     ('azure', 'remote_identity'),
     ('azure', 'vpc_name'),
+    ('gcp', 'remote_identity'),
     ('gcp', 'vpc_name'),
     ('gcp', 'subnet_names'),
     ('gcp', 'managed_instance_group'),

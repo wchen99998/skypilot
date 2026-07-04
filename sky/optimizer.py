@@ -59,6 +59,12 @@ def _create_table(field_names: List[str]) -> prettytable.PrettyTable:
     return log_utils.create_table(field_names, **table_kwargs)
 
 
+def _format_optional_resource_quantity(x: Optional[float]) -> str:
+    if x is None:
+        return '-'
+    return common_utils.format_float(x)
+
+
 def _is_dag_resources_ordered(dag: 'dag_lib.Dag') -> bool:
     graph = dag.get_graph()
     topo_order = list(nx.topological_sort(graph))
@@ -798,16 +804,8 @@ class Optimizer:
             vcpus_, mem_ = cloud.get_vcpus_mem_from_instance_type(
                 resources.instance_type)
 
-            def format_number(x: Optional[float]) -> str:
-                if x is None:
-                    return '-'
-                elif x.is_integer():
-                    return str(int(x))
-                else:
-                    return f'{x:.1f}'
-
-            vcpus = format_number(vcpus_)
-            mem = format_number(mem_)
+            vcpus = _format_optional_resource_quantity(vcpus_)
+            mem = _format_optional_resource_quantity(mem_)
 
             # Format infra as CLOUD (REGION/ZONE)
             infra = resources.infra.formatted_str()
@@ -835,16 +833,8 @@ class Optimizer:
             vcpus_, mem_ = cloud.get_vcpus_mem_from_instance_type(
                 resources.instance_type)
 
-            def format_number(x: Optional[float]) -> str:
-                if x is None:
-                    return '-'
-                elif x.is_integer():
-                    return str(int(x))
-                else:
-                    return f'{x:.1f}'
-
-            vcpus = format_number(vcpus_)
-            mem = format_number(mem_)
+            vcpus = _format_optional_resource_quantity(vcpus_)
+            mem = _format_optional_resource_quantity(mem_)
 
             infra = resources.infra.formatted_str()
 
@@ -1228,12 +1218,8 @@ class Optimizer:
                 cloud = best_resources.cloud
                 vcpus_, mem_ = cloud.get_vcpus_mem_from_instance_type(
                     instance_type)
-                if vcpus_ is not None:
-                    vcpus = (str(int(vcpus_))
-                             if vcpus_.is_integer() else f'{vcpus_:.1f}')
-                if mem_ is not None:
-                    mem = (str(int(mem_))
-                           if mem_.is_integer() else f'{mem_:.1f}')
+                vcpus = _format_optional_resource_quantity(vcpus_)
+                mem = _format_optional_resource_quantity(mem_)
 
             # Get accelerators
             accelerators = best_resources.get_accelerators_str()

@@ -911,6 +911,69 @@ class TestGCPSchema(unittest.TestCase):
         with self.assertRaises(jsonschema.exceptions.ValidationError):
             jsonschema.validate(instance=config, schema=self.gcp_schema)
 
+    def test_gcp_managed_instance_group_run_duration_bounds(self):
+        """Test GCP MIG run_duration validates Flex-start bounds."""
+        for run_duration in (600, 3600, 604800):
+            config = {
+                'managed_instance_group': {
+                    'run_duration': run_duration,
+                },
+            }
+            jsonschema.validate(instance=config, schema=self.gcp_schema)
+
+        for run_duration in (599, 604801):
+            config = {
+                'managed_instance_group': {
+                    'run_duration': run_duration,
+                },
+            }
+            with self.assertRaises(jsonschema.exceptions.ValidationError):
+                jsonschema.validate(instance=config, schema=self.gcp_schema)
+
+    def test_gcp_managed_instance_group_tpu_topology_fields(self):
+        """Test GCP MIG accepts TPU topology fields."""
+        config = {
+            'managed_instance_group': {
+                'run_duration': 3600,
+                'accelerator_topology': '4x8',
+                'accelerator_topology_mode': 'AUTO_CONNECT',
+            },
+        }
+
+        jsonschema.validate(instance=config, schema=self.gcp_schema)
+
+    def test_gcp_managed_instance_group_provision_timeout(self):
+        """Test GCP MIG provision_timeout must be positive."""
+        config = {
+            'managed_instance_group': {
+                'run_duration': 3600,
+                'provision_timeout': 1,
+            },
+        }
+        jsonschema.validate(instance=config, schema=self.gcp_schema)
+
+        config['managed_instance_group']['provision_timeout'] = 0
+        with self.assertRaises(jsonschema.exceptions.ValidationError):
+            jsonschema.validate(instance=config, schema=self.gcp_schema)
+
+    def test_gcp_managed_instance_group_rejects_invalid_tpu_topology(self):
+        """Test GCP MIG rejects malformed TPU topology fields."""
+        invalid_configs = ({
+            'accelerator_topology': '4',
+        }, {
+            'accelerator_topology': '4X8',
+        }, {
+            'accelerator_topology': '0x8',
+        }, {
+            'accelerator_topology_mode': 'INVALID',
+        })
+
+        for managed_instance_group in invalid_configs:
+            managed_instance_group['run_duration'] = 3600
+            config = {'managed_instance_group': managed_instance_group}
+            with self.assertRaises(jsonschema.exceptions.ValidationError):
+                jsonschema.validate(instance=config, schema=self.gcp_schema)
+
 
 class TestAzureSchema(unittest.TestCase):
     """Tests for the Azure config schema."""

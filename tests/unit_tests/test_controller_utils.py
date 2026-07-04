@@ -61,11 +61,14 @@ def test_get_controller_resources(controller_type: str,
                                   expected: Dict[str, Any], monkeypatch,
                                   enable_all_clouds):
 
-    def get_custom_controller_resources(keys, default):
+    def get_custom_controller_resources(keys,
+                                        default=None,
+                                        default_value=None,
+                                        **kwargs):
+        del kwargs
         if keys == (controller_type, 'controller', 'resources'):
             return custom_controller_resources_config
-        else:
-            return default
+        return default if default is not None else default_value
 
     monkeypatch.setattr('sky.skypilot_config.loaded', lambda: True)
     monkeypatch.setattr('sky.skypilot_config.get_nested',
@@ -78,6 +81,7 @@ def test_get_controller_resources(controller_type: str,
             controller=controller_utils.Controllers.from_type(controller_type),
             task_resources=[]))[0]
     controller_resources_config = controller_resources.to_yaml_config()
+    controller_resources_config.pop('_cluster_config_overrides', None)
     for k, v in expected.items():
         assert controller_resources_config.get(k) == v, (
             controller_type, custom_controller_resources_config, expected,
@@ -93,6 +97,7 @@ def _check_controller_resources(
     for r in controller_resources:
         config = r.to_yaml_config()
         infra = config.pop('infra')
+        config.pop('_cluster_config_overrides', None)
         assert infra in expected_infra_list
         expected_infra_list.remove(infra)
         assert config == default_controller_resources, config
@@ -158,6 +163,7 @@ def test_get_controller_resources_with_task_resources(
         ])
     assert len(controller_resources) == 1
     config = list(controller_resources)[0].to_yaml_config()
+    config.pop('_cluster_config_overrides', None)
     assert config == default_controller_resources, config
 
     # 4. All resources have clouds, regions, and zones specified.

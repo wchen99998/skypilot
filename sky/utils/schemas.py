@@ -1897,10 +1897,24 @@ def get_config_schema():
                     'properties': {
                         'run_duration': {
                             'type': 'integer',
+                            'minimum': 600,
+                            'maximum': 604800,
                         },
                         'provision_timeout': {
                             'type': 'integer',
-                        }
+                            'minimum': 1,
+                        },
+                        'accelerator_topology': {
+                            'type': 'string',
+                            'pattern': '^[1-9][0-9]*(x[1-9][0-9]*)+$',
+                        },
+                        'accelerator_topology_mode': {
+                            'type': 'string',
+                            'enum': [
+                                'AUTO_CONNECT',
+                                'PROVISION_ONLY',
+                            ],
+                        },
                     }
                 },
                 'force_enable_external_ips': {

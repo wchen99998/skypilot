@@ -60,9 +60,14 @@ if typing.TYPE_CHECKING:
     import psutil
 
     from sky import task as task_lib
+    from sky.provision.gcp import instance_utils as gcp_instance_utils
+    from sky.provision.gcp import mig_utils as gcp_mig_utils
     from sky.schemas.generated import jobsv1_pb2
 else:
     psutil = adaptors_common.LazyImport('psutil')
+    gcp_instance_utils = adaptors_common.LazyImport(
+        'sky.provision.gcp.instance_utils')
+    gcp_mig_utils = adaptors_common.LazyImport('sky.provision.gcp.mig_utils')
     jobsv1_pb2 = adaptors_common.LazyImport('sky.schemas.generated.jobsv1_pb2')
 
 logger = sky_logging.init_logger('sky.jobs.controller')
@@ -115,6 +120,45 @@ def _get_dag(job_id: int) -> 'sky.Dag':
     dag = dag_utils.load_dag_from_yaml_str(dag_content)
     assert dag.name is not None, dag
     return dag
+
+
+def _cleanup_gcp_tpu_mig_if_needed(task: 'sky.Task', cluster_name: str) -> None:
+    resources = task.best_resources
+    if resources is None:
+        if len(task.resources) != 1:
+            return
+        resources = next(iter(task.resources))
+
+    cloud = resources.cloud
+    if cloud is None or not cloud.is_same_cloud(sky.GCP()):
+        return
+
+    if resources.instance_type is None:
+        return
+    if not gcp_mig_utils.is_compute_tpu_machine_type(resources.instance_type):
+        return
+
+    region = resources.region
+    if region is None:
+        return
+
+    managed_instance_group_config = (
+        skypilot_config.get_effective_region_config(
+            cloud='gcp',
+            region=region,
+            keys=('managed_instance_group',),
+            default_value=None,
+            override_configs=resources.cluster_config_overrides))
+    if managed_instance_group_config is None:
+        return
+
+    cluster_name_on_cloud = common_utils.make_cluster_name_on_cloud(
+        cluster_name, max_length=cloud.max_cluster_name_length())
+    project_id = sky.GCP.get_project_id()
+    logger.info('Ensuring GCP TPU DWS MIG resources are cleaned up for '
+                f'{cluster_name_on_cloud!r}.')
+    gcp_instance_utils.GCPManagedInstanceGroup.delete_tpu_mig_resources(
+        project_id, region, cluster_name_on_cloud)
 
 
 def _add_k8s_annotations(task: 'sky.Task', job_id: int) -> None:
@@ -2584,10 +2628,20 @@ class ControllerManager:
                     cluster_name = (
                         managed_job_utils.generate_managed_job_cluster_name(
                             task.name, job_id))
-                    managed_job_utils.terminate_cluster(
-                        cluster_name,
-                        graceful=graceful,
-                        graceful_timeout=graceful_timeout)
+                    try:
+                        managed_job_utils.terminate_cluster(
+                            cluster_name,
+                            graceful=graceful,
+                            graceful_timeout=graceful_timeout)
+                    except Exception:
+                        try:
+                            _cleanup_gcp_tpu_mig_if_needed(task, cluster_name)
+                        except Exception as cleanup_error:  # pylint: disable=broad-except
+                            logger.warning(
+                                'TPU MIG cleanup also failed after cluster '
+                                'termination failed: %s', cleanup_error)
+                        raise
+                    _cleanup_gcp_tpu_mig_if_needed(task, cluster_name)
                     status = core.status(cluster_names=[cluster_name],
                                          all_users=True)
                     assert (len(status) == 0 or

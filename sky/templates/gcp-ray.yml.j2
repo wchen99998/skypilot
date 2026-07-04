@@ -106,6 +106,12 @@ available_node_types:
         {%- if provision_timeout is defined and provision_timeout is not none %}
         provision_timeout: {{ provision_timeout }}
         {%- endif %}
+        {%- if accelerator_topology is defined and accelerator_topology is not none %}
+        accelerator_topology: {{ accelerator_topology }}
+        {%- endif %}
+        {%- if accelerator_topology_mode is defined and accelerator_topology_mode is not none %}
+        accelerator_topology_mode: {{ accelerator_topology_mode }}
+        {%- endif %}
       {%- endif %}
       {%- if specific_reservations %}
       reservationAffinity:
@@ -233,9 +239,9 @@ head_node_type: ray_head_default
 file_mounts: {
   "{{sky_ray_yaml_remote_path}}": "{{sky_ray_yaml_local_path}}",
   "{{sky_remote_path}}/{{sky_wheel_hash}}": "{{sky_local_path}}",
+  "~/.ssh/sky-cluster-key": "{{ssh_private_key}}",
 {%- for remote_path, local_path in credentials.items() %}
   "{{remote_path}}": "{{local_path}}",
-  "~/.ssh/sky-cluster-key": "{{ssh_private_key}}",
 {%- endfor %}
 }
 

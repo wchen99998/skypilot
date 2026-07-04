@@ -7,6 +7,13 @@ from sky import resources as resources_lib
 from sky import task as task_lib
 
 
+def test_format_optional_resource_quantity_accepts_ints_and_floats():
+    assert optimizer._format_optional_resource_quantity(None) == '-'
+    assert optimizer._format_optional_resource_quantity(180) == '180'
+    assert optimizer._format_optional_resource_quantity(180.0) == '180'
+    assert optimizer._format_optional_resource_quantity(180.5) == '180.5'
+
+
 def _optimize_ordered_task_with_mock_launchable(dag, launchable_call_indexes):
     fill_calls = []
 

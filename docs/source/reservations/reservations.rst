@@ -141,7 +141,9 @@ GCP `Dynamic Workload Scheduler (DWS) <https://cloud.google.com/blog/products/co
 Using DWS for VMs
 ~~~~~~~~~~~~~~~~~
 
-SkyPilot allows you to launch resources via DWS by specifying the ``gcp.managed_instance_group`` field in ``~/.sky/config.yaml``:
+SkyPilot allows you to launch GPU VMs and supported TPU VM machine types via
+DWS Flex-start provisioning by specifying the ``gcp.managed_instance_group``
+field in ``~/.sky/config.yaml``:
 
 .. code-block:: yaml
 
@@ -151,8 +153,23 @@ SkyPilot allows you to launch resources via DWS by specifying the ``gcp.managed_
         provision_timeout: 900
 
 
-1. ``run_duration``: duration for a created instance to be kept alive (in seconds, required).
+1. ``run_duration``: duration for a created Flex-start instance to be kept
+   alive (in seconds, required). The value must be between 10 minutes and
+   7 days.
 2. ``provision_timeout``: timeout for provisioning an instance with DWS (in seconds, optional). If the timeout is reached without requested resources being provisioned, SkyPilot will automatically :ref:`failover <auto-failover>` to other clouds/regions/zones to get the resources.
+3. ``accelerator_topology``: required for TPU VM MIGs. SkyPilot uses it to
+   create the GCP workload policy and a bulk target-size MIG for the full TPU
+   slice. ``accelerator_topology_mode`` is optional and defaults to
+   ``AUTO_CONNECT``. The topology and ``num_nodes`` must form one of Google's
+   documented Compute Engine TPU slice configurations; GKE-only shapes are not
+   accepted.
+
+For TPU slices, the bulk MIG is a single queued request. It can remain queued
+for longer than two hours, and Google Cloud retries it without SkyPilot
+resubmitting the request or losing its queue position. Set
+``provision_timeout`` to the total amount of time you are willing to wait.
+The standalone zonal Flex-start VM request-validity limit does not apply to
+this TPU bulk-MIG workflow.
 
 See :ref:`config-yaml` for more details.
 

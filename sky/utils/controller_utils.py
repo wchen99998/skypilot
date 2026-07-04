@@ -44,6 +44,7 @@ from sky.utils import config_utils
 from sky.utils import env_options
 from sky.utils import registry
 from sky.utils import rich_utils
+from sky.utils import schemas
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
 
@@ -72,6 +73,12 @@ CONTROLLER_RESOURCES_NOT_VALID_MESSAGE = (
 # cloud as controller.
 _LOCAL_SKYPILOT_CONFIG_PATH_SUFFIX = (
     '__skypilot:local_skypilot_config_path.yaml')
+
+_GCP_SERVICE_ACCOUNT_REMOTE_IDENTITY_OVERRIDE = {
+    'gcp': {
+        'remote_identity': schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value,
+    },
+}
 
 
 @dataclasses.dataclass
@@ -851,11 +858,30 @@ def get_controller_resources(
                     cloud=registry.CLOUD_REGISTRY.from_str(cloud_name),
                     region=region,
                     zone=zone)
-                result.add(resource_copy)
+                result.add(_with_controller_remote_identity(resource_copy))
 
     if not result:
-        return {controller_resources_to_use}
+        return {_with_controller_remote_identity(controller_resources_to_use)}
     return result
+
+
+def _with_controller_remote_identity(
+        controller_resources: 'resources.Resources') -> 'resources.Resources':
+    """Default GCP controllers to metadata service-account credentials."""
+    if (controller_resources.cloud is not None and
+            not isinstance(controller_resources.cloud, clouds.GCP)):
+        return controller_resources
+    remote_identity_config = (
+        skypilot_config.get_effective_workspace_region_config(
+            cloud='gcp',
+            region=controller_resources.region,
+            keys=('remote_identity',),
+            default_value=None,
+            override_configs=controller_resources.cluster_config_overrides))
+    if remote_identity_config is not None:
+        return controller_resources
+    return controller_resources.copy(
+        _cluster_config_overrides=_GCP_SERVICE_ACCOUNT_REMOTE_IDENTITY_OVERRIDE)
 
 
 def get_controller_mem_size_gb() -> float:

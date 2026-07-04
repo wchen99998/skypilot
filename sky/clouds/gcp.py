@@ -126,6 +126,21 @@ _DEFAULT_GPU_IMAGE_ID = 'skypilot:custom-gpu-ubuntu-2204-cuda13'
 # GPUs (V100, P100, P4, M60) that the open kernel module does not support.
 _DEFAULT_GPU_CUDA12_IMAGE_ID = 'skypilot:custom-gpu-ubuntu-2204'
 _DEFAULT_GPU_K80_IMAGE_ID = 'skypilot:k80-debian-10'
+_DEFAULT_TPU_V6E_IMAGE_ID = (
+    'projects/ubuntu-os-accelerator-images/global/images/family/'
+    'ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e')
+_DEFAULT_TPU7X_IMAGE_ID = (
+    'projects/ubuntu-os-accelerator-images/global/images/family/'
+    'ubuntu-accel-2404-amd64-tpu-tpu7x')
+_COMPUTE_TPU_MACHINE_TYPE_PREFIXES = ('ct6e-standard-', 'tpu7x-standard-')
+_COMPUTE_TPU_FLEX_START_ZONES = {
+    _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[0]: {
+        'asia-northeast1-b',
+        'us-east5-a',
+        'us-south1-ai1b',
+    },
+    _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[1]: {'us-central1-c'},
+}
 # Use COS image with GPU Direct support.
 # Need to contact GCP support to build our own image for GPUDirect-TCPX support.
 # Refer to https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/machine-learning/a3-highgpu-8g/README.md#before-starting
@@ -259,13 +274,16 @@ class GCP(clouds.Cloud):
                 'num_nodes to 1.')
         # TODO(zhwu): We probably need to store the MIG requirement in resources
         # because `skypilot_config` may change for an existing cluster.
-        # Clusters created with MIG (only GPU clusters) cannot be stopped.
+        # Clusters created with MIG cannot be stopped.
+        is_compute_tpu = (resources.instance_type is not None and
+                          resources.instance_type.startswith(
+                              _COMPUTE_TPU_MACHINE_TYPE_PREFIXES))
         if (skypilot_config.get_effective_region_config(
                 cloud='gcp',
                 region=resources.region,
                 keys=('managed_instance_group',),
                 override_configs=resources.cluster_config_overrides) is not None
-                and resources.accelerators):
+                and (resources.accelerators or is_compute_tpu)):
             unsupported[clouds.CloudImplementationFeatures.STOP] = (
                 'Managed Instance Group (MIG) does not support stopping yet.')
             unsupported[clouds.CloudImplementationFeatures.SPOT_INSTANCE] = (
@@ -330,6 +348,34 @@ class GCP(clouds.Cloud):
                         if zones:
                             regions.append(r1.set_zones(zones))
                         break
+
+        if (resources is not None and
+                instance_type.startswith(_COMPUTE_TPU_MACHINE_TYPE_PREFIXES)):
+            machine_type_prefix = next(
+                prefix for prefix in _COMPUTE_TPU_MACHINE_TYPE_PREFIXES
+                if instance_type.startswith(prefix))
+            flex_start_zones = _COMPUTE_TPU_FLEX_START_ZONES[
+                machine_type_prefix]
+            filtered_regions = []
+            for offered_region in regions:
+                managed_instance_group_config = (
+                    skypilot_config.get_effective_region_config(
+                        cloud='gcp',
+                        region=offered_region.name,
+                        keys=('managed_instance_group',),
+                        default_value=None,
+                        override_configs=resources.cluster_config_overrides))
+                if managed_instance_group_config is None:
+                    filtered_regions.append(offered_region)
+                    continue
+                assert offered_region.zones is not None, offered_region
+                zones = [
+                    offered_zone for offered_zone in offered_region.zones
+                    if offered_zone.name in flex_start_zones
+                ]
+                if zones:
+                    filtered_regions.append(offered_region.set_zones(zones))
+            regions = filtered_regions
 
         if region is not None:
             regions = [r for r in regions if r.name == region]
@@ -554,7 +600,17 @@ class GCP(clouds.Cloud):
         image_id = _DEFAULT_CPU_IMAGE_ID
 
         r = resources
+        if r.instance_type is not None:
+            if r.instance_type.startswith(
+                    _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[0]):
+                image_id = _DEFAULT_TPU_V6E_IMAGE_ID
+            elif r.instance_type.startswith(
+                    _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[1]):
+                image_id = _DEFAULT_TPU7X_IMAGE_ID
         # Find GPU spec, if any.
+        is_compute_tpu = (
+            r.instance_type is not None and
+            r.instance_type.startswith(_COMPUTE_TPU_MACHINE_TYPE_PREFIXES))
         resources_vars = {
             'instance_type': r.instance_type,
             'region': region_name,
@@ -570,6 +626,7 @@ class GCP(clouds.Cloud):
                 r.instance_type,
                 GCP.failover_disk_tier(r.instance_type, r.disk_tier)),
         }
+        docker_run_options = ['--privileged'] if is_compute_tpu else []
         enable_gpu_direct = skypilot_config.get_effective_region_config(
             cloud='gcp',
             region=region_name,
@@ -601,7 +658,7 @@ class GCP(clouds.Cloud):
                     'gcp_queued_resource')
                 # TPU VMs require privileged mode for docker containers to
                 # access TPU devices.
-                resources_vars['docker_run_options'] = ['--privileged']
+                docker_run_options.append('--privileged')
             else:
                 # Convert to GCP names:
                 # https://cloud.google.com/compute/docs/gpus
@@ -689,7 +746,6 @@ class GCP(clouds.Cloud):
 
         resources_vars['user_data'] = None
         user_data = ''
-        docker_run_options = []
         if device_mount_points:
             # Build the device_mounts array
             device_mounts_array = []
@@ -1247,6 +1303,10 @@ class GCP(clouds.Cloud):
             # a3-ultragpu, n4, a4, and g4 instances only support
             # hyperdisk-balanced.
             _propagate_disk_type(all='hyperdisk-balanced')
+        if series in ('ct6e', 'tpu7x'):
+            # Compute Engine TPU VMs reject persistent disk boot disk types
+            # such as pd-balanced.
+            _propagate_disk_type(all='hyperdisk-balanced')
 
         # Series specific handling
         if series == 'n2':
@@ -1407,6 +1467,24 @@ class GCP(clouds.Cloud):
         accelerator = list(resources.accelerators.keys())[0]
         use_spot = resources.use_spot
         region = resources.region
+        managed_instance_group_config = (
+            skypilot_config.get_effective_region_config(
+                cloud='gcp',
+                region=region,
+                keys=('managed_instance_group',),
+                default_value=None,
+                override_configs=resources.cluster_config_overrides))
+        if managed_instance_group_config is not None:
+            # Flex-start VMs use DWS. GCP documents that these requests consume
+            # preemptible quota once a project has requested preemptible quota;
+            # projects that have never requested preemptible quota may consume
+            # standard quota instead. Avoid incorrectly failing early on the
+            # on-demand quota check and let the DWS provisioning request handle
+            # quota/capacity.
+            logger.warning(
+                'Skipping GCP quota precheck for DWS/Flex-start. The DWS '
+                'provisioning request will validate quota and capacity.')
+            return True
 
         # pylint: disable=import-outside-toplevel
         from sky.catalog import gcp_catalog

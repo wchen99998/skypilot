@@ -1319,19 +1319,51 @@ Example:
 Managed instance group / DWS (optional).
 
 SkyPilot supports launching instances in a managed instance group (MIG)
-which schedules the GPU instance creation through DWS, offering a better
-availability. This feature is only applied when a resource request
-contains GPU instances.
+with Flex-start provisioning through DWS, offering a better availability.
+This feature is applied when a resource request contains GPU instances or
+GCP TPU VM machine types that support Flex-start MIGs.
 
 ``run_duration``: Duration for a created instance to be kept alive (in seconds, required).
-This is required for the DWS to work properly. After the specified duration,
-the instance will be terminated.
+This is required for DWS Flex-start provisioning to work properly. After the
+specified duration, the instance will be terminated. The value must be between
+``600`` (10 minutes) and ``604800`` (7 days).
 
 ``provision_timeout``: Timeout for provisioning an instance by DWS (in seconds, optional).
 This timeout determines how long SkyPilot will wait for a managed instance
 group to create the requested resources before giving up, deleting the MIG
 and failing over to other locations. Larger timeouts may increase the chance
 for getting a resource, but will block failover to go to other zones/regions/clouds.
+For TPU VM MIGs, SkyPilot submits one regional bulk MIG request and keeps that
+request queued for the full timeout. Google Cloud retries the request as
+capacity becomes available, so this value can be longer than two hours without
+resubmitting or losing queue position. The two-hour request-validity limit for
+standalone zonal Flex-start VMs does not apply to bulk TPU MIGs.
+See Google Cloud's `TPU Flex-start documentation
+<https://docs.cloud.google.com/tpu/docs/create-flex-start-compute>`_ and
+`bulk MIG documentation
+<https://docs.cloud.google.com/compute/docs/instance-groups/about-bulk-mode>`_.
+
+``accelerator_topology``: Accelerator topology for GCP TPU VM MIGs, such as
+``4x8``. SkyPilot uses this to create the TPU workload policy required by GCP.
+
+``accelerator_topology_mode``: Accelerator topology mode for GCP TPU VM MIGs.
+Defaults to ``AUTO_CONNECT`` when omitted.
+
+Compute Engine TPU Flex-start currently supports TPU v6e machine types in
+``asia-northeast1-b``, ``us-east5-a``, and ``us-south1-ai1b``, and
+``tpu7x-standard-4t`` in ``us-central1-c``. SkyPilot validates the topology
+and VM count against Google's documented `TPU v6e configurations
+<https://docs.cloud.google.com/tpu/docs/v6e#supported-configurations>`_ and
+`TPU7x configurations
+<https://docs.cloud.google.com/tpu/docs/tpu7x#supported-configurations>`_. In
+particular, the two-VM v6e ``2x4`` topology is GKE-only and is rejected by the
+Compute Engine provisioner. Google currently marks TPU7x Flex-start access as
+`allowlist restricted
+<https://docs.cloud.google.com/compute/docs/tpus/tpu-machines#consumption-option-availability>`_;
+contact your Google Cloud account team if the request is rejected for access.
+SkyPilot automatically selects Google's TPU-enabled Ubuntu image for
+``ct6e-standard-*`` and ``tpu7x-standard-*`` machine types unless ``image_id``
+is set explicitly.
 
 Default: ``900``.
 
@@ -1343,6 +1375,27 @@ Example:
     managed_instance_group:
       run_duration: 3600
       provision_timeout: 900
+      accelerator_topology: 4x8
+      accelerator_topology_mode: AUTO_CONNECT
+
+For example, a two-host TPU7x slice uses the ``2x2x2`` topology (8 chips,
+4 chips per VM):
+
+.. code-block:: yaml
+
+  config:
+    gcp:
+      managed_instance_group:
+        run_duration: 86400
+        provision_timeout: 21600
+        accelerator_topology: 2x2x2
+        accelerator_topology_mode: AUTO_CONNECT
+
+  resources:
+    infra: gcp/us-central1/us-central1-c
+    instance_type: tpu7x-standard-4t
+
+  num_nodes: 2
 
 .. _config-yaml-gcp-remote-identity:
 
@@ -1353,7 +1406,17 @@ Identity to use for GCP instances (optional).
 
 Please refer to the aws.remote_identity section above for more details.
 
-Default: ``LOCAL_CREDENTIALS``.
+GCP jobs and serve controllers default to ``SERVICE_ACCOUNT`` when this option
+is not set. The local client still uses local Application Default Credentials
+to create the controller initially. Once the controller is running, Google
+metadata credentials for the attached SkyPilot service account refresh
+automatically, so long-running provisioning and recovery do not depend on a
+user's ``gcloud auth login`` session. Set ``LOCAL_CREDENTIALS`` explicitly to
+retain credential-file upload behavior; uploaded user credentials remain
+subject to any organization session-duration policy.
+
+Default: ``LOCAL_CREDENTIALS`` for ordinary clusters; ``SERVICE_ACCOUNT`` for
+GCP jobs and serve controllers.
 
 .. _config-yaml-gcp-enable-gvnic:
 
