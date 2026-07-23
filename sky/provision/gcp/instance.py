@@ -13,6 +13,7 @@ from sky.provision import constants as provision_constants
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants
 from sky.provision.gcp import instance_utils
+from sky.provision.gcp import mig_utils
 from sky.utils import common_utils
 from sky.utils import resources_utils
 from sky.utils import status_lib
@@ -69,9 +70,19 @@ def query_instances(
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     zone = provider_config['availability_zone']
     project_id = provider_config['project_id']
-    label_filters = {
-        provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
-    }
+    included_instances = None
+    if provider_config.get('use_managed_instance_group', False):
+        group_name = mig_utils.get_managed_instance_group_name(
+            cluster_name_on_cloud)
+        included_instances = mig_utils.list_managed_instance_group_instances(
+            project_id, zone, group_name)
+        if not included_instances:
+            return {}
+        label_filters = None
+    else:
+        label_filters = {
+            provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
+        }
 
     handler: Type[
         instance_utils.GCPInstance] = instance_utils.GCPComputeInstance
@@ -84,6 +95,7 @@ def query_instances(
         zone,
         label_filters,
         status_filters=None,
+        included_instances=included_instances,
     )
 
     raw_statuses = {}

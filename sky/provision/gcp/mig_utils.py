@@ -467,6 +467,57 @@ def check_region_managed_instance_group_exists(project_id: str, region: str,
     return True
 
 
+def list_managed_instance_group_instances(project_id: str, zone: str,
+                                          group_name: str) -> List[str]:
+    """Return the instances owned by a regional or zonal MIG.
+
+    MIG membership is the authoritative cluster boundary. Labels can be
+    temporarily stale or incorrectly copied from another instance template,
+    so status queries must not use labels to decide which VMs belong to a MIG.
+    """
+    compute = gcp.build('compute',
+                        'v1',
+                        credentials=None,
+                        cache_discovery=False)
+
+    def list_instances(managers: Any, **kwargs: str) -> List[str]:
+        instance_names = []
+        while True:
+            response = managers.listManagedInstances(**kwargs).execute(
+                num_retries=_GCP_API_MAX_RETRIES)
+            instance_names.extend(
+                instance['name']
+                for instance in response.get('managedInstances', []))
+            page_token = response.get('nextPageToken')
+            if page_token is None:
+                return instance_names
+            kwargs['pageToken'] = page_token
+
+    region = zone.rpartition('-')[0]
+    try:
+        return list_instances(
+            compute.regionInstanceGroupManagers(),
+            project=project_id,
+            region=region,
+            instanceGroupManager=group_name,
+        )
+    except gcp.http_error_exception() as e:
+        if REGION_MIG_RESOURCE_NOT_FOUND_PATTERN.search(str(e)) is None:
+            raise
+
+    try:
+        return list_instances(
+            compute.instanceGroupManagers(),
+            project=project_id,
+            zone=zone,
+            instanceGroupManager=group_name,
+        )
+    except gcp.http_error_exception() as e:
+        if MIG_RESOURCE_NOT_FOUND_PATTERN.search(str(e)) is None:
+            raise
+        return []
+
+
 def delete_region_managed_instance_group(project_id: str, region: str,
                                          group_name: str) -> dict:
     logger.debug(f'Deleting regional managed instance group {group_name!r}.')

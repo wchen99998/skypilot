@@ -1,4 +1,5 @@
 import pathlib
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ from sky.jobs import controller as managed_job_controller
 from sky.provision import common
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants as gcp_constants
+from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils
 from sky.provision.gcp import mig_utils
 from sky.provision.gcp import volume_utils as gcp_volume_utils
@@ -28,6 +30,7 @@ from sky.utils import config_utils
 from sky.utils import controller_utils
 from sky.utils import resources_utils
 from sky.utils import schemas
+from sky.utils import status_lib
 
 
 def test_gcp_rtxpro6000_instance_type_mapping():
@@ -200,6 +203,156 @@ def test_gcp_mig_instance_template_uses_flex_start(monkeypatch):
         },
         'onHostMaintenance': 'TERMINATE',
     }
+
+
+def test_gcp_query_mig_instances_uses_group_membership(monkeypatch):
+    monkeypatch.setattr(mig_utils, 'list_managed_instance_group_instances',
+                        lambda *args: ['cluster-head', 'cluster-worker'])
+    filter_calls = []
+
+    def filter_instances(cls,
+                         project_id,
+                         zone,
+                         label_filters,
+                         status_filters,
+                         included_instances=None,
+                         excluded_instances=None):
+        filter_calls.append((project_id, zone, label_filters, status_filters,
+                             included_instances, excluded_instances))
+        return {
+            'cluster-head': {
+                'status': 'RUNNING',
+            },
+            'cluster-worker': {
+                'status': 'RUNNING',
+            },
+        }
+
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'filter',
+                        classmethod(filter_instances))
+
+    statuses = gcp_instance.query_instances(
+        cluster_name='display-name',
+        cluster_name_on_cloud='cluster',
+        provider_config={
+            'availability_zone': 'us-east5-a',
+            'project_id': 'project',
+            'use_managed_instance_group': True,
+        })
+
+    assert statuses == {
+        'cluster-head': (status_lib.ClusterStatus.UP, None),
+        'cluster-worker': (status_lib.ClusterStatus.UP, None),
+    }
+    assert filter_calls == [('project', 'us-east5-a', None, None,
+                             ['cluster-head', 'cluster-worker'], None)]
+
+
+def test_gcp_query_missing_mig_returns_no_instances(monkeypatch):
+    monkeypatch.setattr(mig_utils, 'list_managed_instance_group_instances',
+                        lambda *args: [])
+    filter_instances = MagicMock()
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'filter',
+                        filter_instances)
+
+    statuses = gcp_instance.query_instances(
+        cluster_name='display-name',
+        cluster_name_on_cloud='cluster',
+        provider_config={
+            'availability_zone': 'us-east5-a',
+            'project_id': 'project',
+            'use_managed_instance_group': True,
+        })
+
+    assert statuses == {}
+    filter_instances.assert_not_called()
+
+
+def test_gcp_list_regional_mig_instances_paginates(monkeypatch):
+    compute = MagicMock()
+    regional_list = (
+        compute.regionInstanceGroupManagers.return_value.listManagedInstances)
+    regional_list.return_value.execute.side_effect = [{
+        'managedInstances': [{
+            'name': 'cluster-head',
+        }],
+        'nextPageToken': 'next-page',
+    }, {
+        'managedInstances': [{
+            'name': 'cluster-worker',
+        }],
+    }]
+    monkeypatch.setattr(mig_utils.gcp, 'build', lambda *args, **kwargs: compute)
+
+    instances = mig_utils.list_managed_instance_group_instances(
+        'project', 'us-east5-a', 'sky-mig-cluster')
+
+    assert instances == ['cluster-head', 'cluster-worker']
+    assert regional_list.call_args_list == [
+        call(project='project',
+             region='us-east5',
+             instanceGroupManager='sky-mig-cluster'),
+        call(project='project',
+             region='us-east5',
+             instanceGroupManager='sky-mig-cluster',
+             pageToken='next-page'),
+    ]
+
+
+def test_gcp_list_zonal_mig_instances_after_regional_not_found(monkeypatch):
+
+    class FakeHttpError(Exception):
+        pass
+
+    compute = MagicMock()
+    regional_execute = (compute.regionInstanceGroupManagers.return_value.
+                        listManagedInstances.return_value.execute)
+    regional_execute.side_effect = FakeHttpError(
+        "The resource 'projects/project/regions/us-east5/"
+        "instanceGroupManagers/sky-mig-cluster' was not found")
+    zonal_list = compute.instanceGroupManagers.return_value.listManagedInstances
+    zonal_list.return_value.execute.return_value = {
+        'managedInstances': [{
+            'name': 'cluster-head',
+        }],
+    }
+    monkeypatch.setattr(mig_utils.gcp, 'build', lambda *args, **kwargs: compute)
+    monkeypatch.setattr(mig_utils.gcp, 'http_error_exception',
+                        lambda: FakeHttpError)
+
+    instances = mig_utils.list_managed_instance_group_instances(
+        'project', 'us-east5-a', 'sky-mig-cluster')
+
+    assert instances == ['cluster-head']
+    zonal_list.assert_called_once_with(project='project',
+                                       zone='us-east5-a',
+                                       instanceGroupManager='sky-mig-cluster')
+
+
+def test_gcp_list_missing_mig_returns_no_instances(monkeypatch):
+
+    class FakeHttpError(Exception):
+        pass
+
+    compute = MagicMock()
+    regional_execute = (compute.regionInstanceGroupManagers.return_value.
+                        listManagedInstances.return_value.execute)
+    regional_execute.side_effect = FakeHttpError(
+        "The resource 'projects/project/regions/us-east5/"
+        "instanceGroupManagers/sky-mig-cluster' was not found")
+    zonal_execute = (compute.instanceGroupManagers.return_value.
+                     listManagedInstances.return_value.execute)
+    zonal_execute.side_effect = FakeHttpError(
+        "The resource 'projects/project/zones/us-east5-a/"
+        "instanceGroupManagers/sky-mig-cluster' was not found")
+    monkeypatch.setattr(mig_utils.gcp, 'build', lambda *args, **kwargs: compute)
+    monkeypatch.setattr(mig_utils.gcp, 'http_error_exception',
+                        lambda: FakeHttpError)
+
+    instances = mig_utils.list_managed_instance_group_instances(
+        'project', 'us-east5-a', 'sky-mig-cluster')
+
+    assert instances == []
 
 
 @pytest.mark.parametrize('instance_type',
