@@ -72,6 +72,10 @@ COL_FILE_MOUNTS_BLOB_ID = 'file_mounts_blob_id'
 LEGACY_REQUEST_LOG_PATH_PREFIX = '~/sky_logs/api_server/requests'
 
 DEFAULT_REQUESTS_RETENTION_HOURS = 24  # 1 day
+CLUSTER_TEARDOWN_CANCELLATION_STATUS = (
+    'Cancellation cleanup is owned by sky down/stop.')
+CLUSTER_TEARDOWN_CANCELLATION_TIMEOUT_SECONDS = 30
+_CLUSTER_TEARDOWN_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
 
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
@@ -642,24 +646,96 @@ def request_lock_path(request_id: str) -> str:
     return os.path.join(lock_path, f'.{request_id}.lock')
 
 
-def kill_cluster_requests(cluster_name: str, exclude_request_name: str):
+def kill_cluster_requests(cluster_name: str,
+                          exclude_request_name: str) -> List[str]:
     """Kill all pending and running requests for a cluster.
 
     Args:
         cluster_name: the name of the cluster.
-        exclude_request_names: exclude requests with these names. This is to
+        exclude_request_name: exclude requests with this name. This is to
             prevent killing the caller request.
+
+    Returns:
+        Request IDs whose cancellation must be acknowledged before cluster
+        teardown. This includes requests cancelled by an earlier down/stop or
+        by another API while their executors are still unwinding.
     """
     storage = request_storage.get_request_backend()
-    request_ids = [
-        request_task.request_id
-        for request_task in storage.query_requests(req_filter=RequestTaskFilter(
-            status=RequestStatus.active_statuses(),
-            exclude_request_names=[exclude_request_name],
-            cluster_names=[cluster_name],
-            fields=['request_id']))
-    ]
+    request_tasks = storage.query_requests(req_filter=RequestTaskFilter(
+        status=(RequestStatus.active_statuses() + [RequestStatus.CANCELLED]),
+        exclude_request_names=[exclude_request_name],
+        cluster_names=[cluster_name],
+        fields=['request_id', 'status', 'status_msg', 'pid']))
+    request_ids = []
+    pending_ack_request_ids = []
+    # Mark the cleanup owner before signaling the worker.  The worker reads
+    # this marker while unwinding KeyboardInterrupt and skips its generic
+    # rollback, leaving sky down/stop as the only teardown owner.
+    for request_task in request_tasks:
+        with update_request(request_task.request_id) as request_record:
+            if (request_record is not None and
+                    request_record.status in RequestStatus.active_statuses()):
+                request_record.status_msg = (
+                    CLUSTER_TEARDOWN_CANCELLATION_STATUS)
+                request_ids.append(request_task.request_id)
+            elif (request_record is not None and
+                  request_record.status == RequestStatus.CANCELLED and
+                  request_record.pid is not None):
+                # A previous teardown or generic API cancellation may have
+                # signaled this worker. Include either kind so down/stop cannot
+                # race the worker's rollback. Do not change a generic
+                # cancellation's marker: that worker remains cleanup owner.
+                pending_ack_request_ids.append(request_task.request_id)
     _kill_requests(request_ids)
+    return list(dict.fromkeys(request_ids + pending_ack_request_ids))
+
+
+def wait_for_request_cancellation(
+        request_ids: List[str],
+        timeout: float = CLUSTER_TEARDOWN_CANCELLATION_TIMEOUT_SECONDS) -> None:
+    """Wait until request executors acknowledge that cancellation is complete.
+
+    Request workers are reused, so process exit cannot be used as the
+    acknowledgement. The executor clears its persisted PID in ``finally``,
+    after request and cloud work have stopped. Teardown must observe that
+    acknowledgement before force-unlocking the cluster or touching its cloud
+    resources.
+
+    Raises:
+        RuntimeError: If a request disappears before acknowledging, or if the
+            acknowledgement is not received before ``timeout``.
+    """
+    pending_request_ids = set(request_ids)
+    if not pending_request_ids:
+        return
+
+    storage = request_storage.get_request_backend()
+    deadline = time.monotonic() + timeout
+    while pending_request_ids:
+        for request_id in list(pending_request_ids):
+            request_record = storage.get_request(request_id,
+                                                 fields=['request_id', 'pid'])
+            if request_record is None:
+                raise RuntimeError(
+                    f'Cannot verify cancellation of request {request_id!r}: '
+                    'the request record disappeared before its executor '
+                    'acknowledged cancellation.')
+            if request_record.pid is None:
+                pending_request_ids.remove(request_id)
+
+        if not pending_request_ids:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pending_ids = ', '.join(sorted(pending_request_ids))
+            raise RuntimeError(
+                'Timed out waiting for cancelled request executor(s) to stop '
+                f'cluster work: {pending_ids}. Refusing to continue cluster '
+                'teardown because concurrent cloud operations may still be '
+                'running.')
+        time.sleep(
+            min(_CLUSTER_TEARDOWN_CANCELLATION_POLL_INTERVAL_SECONDS,
+                remaining))
 
 
 def kill_requests(request_ids: Optional[List[str]] = None,
@@ -1136,6 +1212,16 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
     set_exception_stacktrace(e)
     with update_request(request_id) as request_task:
         assert request_task is not None, request_id
+        if request_task.status == RequestStatus.CANCELLED:
+            # Cancellation is terminal. Preserve it even if rollback reports a
+            # failure after the cancellation signal.
+            request_task.set_error(e)
+            if (request_task.status_msg !=
+                    CLUSTER_TEARDOWN_CANCELLATION_STATUS):
+                request_task.status_msg = (
+                    'Request was cancelled, but cancellation cleanup failed: '
+                    f'{common_utils.format_exception(e)}')
+            return
         request_task.status = RequestStatus.FAILED
         request_task.finished_at = time.time()
         request_task.set_error(e)
@@ -1149,6 +1235,14 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     storage = request_storage.get_request_backend()
     async with storage.update_request_async(request_id) as request_task:
         assert request_task is not None, request_id
+        if request_task.status == RequestStatus.CANCELLED:
+            request_task.set_error(e)
+            if (request_task.status_msg !=
+                    CLUSTER_TEARDOWN_CANCELLATION_STATUS):
+                request_task.status_msg = (
+                    'Request was cancelled, but cancellation cleanup failed: '
+                    f'{common_utils.format_exception(e)}')
+            return
         request_task.status = RequestStatus.FAILED
         request_task.finished_at = time.time()
         request_task.set_error(e)
@@ -1158,6 +1252,8 @@ def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
     """Set a request to succeeded and populate the result."""
     with update_request(request_id) as request_task:
         assert request_task is not None, request_id
+        if request_task.status == RequestStatus.CANCELLED:
+            return
         request_task.status = RequestStatus.SUCCEEDED
         request_task.finished_at = time.time()
         if result is not None:
@@ -1172,6 +1268,8 @@ async def set_request_succeeded_async(request_id: str,
     storage = request_storage.get_request_backend()
     async with storage.update_request_async(request_id) as request_task:
         assert request_task is not None, request_id
+        if request_task.status == RequestStatus.CANCELLED:
+            return
         request_task.status = RequestStatus.SUCCEEDED
         request_task.finished_at = time.time()
         if result is not None:

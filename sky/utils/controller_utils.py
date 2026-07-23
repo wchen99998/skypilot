@@ -74,12 +74,6 @@ CONTROLLER_RESOURCES_NOT_VALID_MESSAGE = (
 _LOCAL_SKYPILOT_CONFIG_PATH_SUFFIX = (
     '__skypilot:local_skypilot_config_path.yaml')
 
-_GCP_SERVICE_ACCOUNT_REMOTE_IDENTITY_OVERRIDE = {
-    'gcp': {
-        'remote_identity': schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value,
-    },
-}
-
 
 @dataclasses.dataclass
 class _ControllerSpec:
@@ -880,8 +874,13 @@ def _with_controller_remote_identity(
             override_configs=controller_resources.cluster_config_overrides))
     if remote_identity_config is not None:
         return controller_resources
+    cluster_config_overrides = copy.deepcopy(
+        controller_resources.cluster_config_overrides)
+    gcp_overrides = cluster_config_overrides.setdefault('gcp', {})
+    gcp_overrides.setdefault(
+        'remote_identity', schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value)
     return controller_resources.copy(
-        _cluster_config_overrides=_GCP_SERVICE_ACCOUNT_REMOTE_IDENTITY_OVERRIDE)
+        _cluster_config_overrides=cluster_config_overrides)
 
 
 def get_controller_mem_size_gb() -> float:

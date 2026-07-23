@@ -1,10 +1,14 @@
 """Google Cloud Platform."""
+import configparser
 import enum
+import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import tempfile
 import time
 import typing
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
@@ -54,13 +58,8 @@ DEFAULT_GCP_APPLICATION_CREDENTIAL_PATH: str = (
 GCP_CONFIG_PATH = '~/.config/gcloud/configurations/config_default'
 
 # Minimum set of files under ~/.config/gcloud that grant GCP access.
-_CREDENTIAL_FILES = [
-    'credentials.db',
-    'access_tokens.db',
-    'configurations',
-    'legacy_credentials',
-    'active_config',
-]
+_GCLOUD_CONFIG_DIR = '~/.config/gcloud'
+_STAGED_GCLOUD_CONFIG_DIR = '~/.sky/generated/gcp'
 
 # NOTE: do not expanduser() on this path. It's used as a destination path on the
 # remote cluster.
@@ -133,6 +132,11 @@ _DEFAULT_TPU7X_IMAGE_ID = (
     'projects/ubuntu-os-accelerator-images/global/images/family/'
     'ubuntu-accel-2404-amd64-tpu-tpu7x')
 _COMPUTE_TPU_MACHINE_TYPE_PREFIXES = ('ct6e-standard-', 'tpu7x-standard-')
+_CT6E_EIGHT_CHIP_MACHINE_TYPES = frozenset({
+    'ct6e-standard-8t',
+    'ct6e-standard-8t-tpu',
+})
+_COMPUTE_TPU_FLEX_START_PRICE_FACTOR = 0.5
 _COMPUTE_TPU_FLEX_START_ZONES = {
     _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[0]: {
         'asia-northeast1-b',
@@ -141,6 +145,20 @@ _COMPUTE_TPU_FLEX_START_ZONES = {
     },
     _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[1]: {'us-central1-c'},
 }
+
+
+def _is_compute_tpu_instance_type(instance_type: Optional[str]) -> bool:
+    return (instance_type is not None and
+            instance_type.startswith(_COMPUTE_TPU_MACHINE_TYPE_PREFIXES))
+
+
+def _is_managed_instance_group_eligible(
+        resources: 'resources.Resources') -> bool:
+    return (_is_compute_tpu_instance_type(resources.instance_type) or
+            (resources.accelerators is not None and
+             not gcp_utils.is_tpu(resources)))
+
+
 # Use COS image with GPU Direct support.
 # Need to contact GCP support to build our own image for GPUDirect-TCPX support.
 # Refer to https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/machine-learning/a3-highgpu-8g/README.md#before-starting
@@ -156,7 +174,7 @@ def _run_output(cmd):
     return proc.stdout.decode('ascii')
 
 
-@annotations.ttl_cache(scope='global', timer=time.time, maxsize=1, ttl=5)
+@annotations.ttl_cache(scope='request', timer=time.time, maxsize=1, ttl=5)
 def _get_default():
     # pylint: disable=import-outside-toplevel
     import google.auth
@@ -186,19 +204,28 @@ def is_api_disabled(endpoint: str, project_id: str) -> bool:
 
 
 class GCPIdentityType(enum.Enum):
-    """GCP identity type.
+    """Type of the Application Default Credentials used by GCP APIs."""
 
-    The account type is determined by the current user identity, based on
-    the identity email.
-    """
-    # Example of a service account email:
-    #   skypilot-v1@xxxx.iam.gserviceaccount.com
-    SERVICE_ACCOUNT = 'iam.gserviceaccount.com'
-
+    # Keep the legacy values as well as the legacy member alias: this enum is
+    # internal, but plugins may still construct it by value.
+    AUTHORIZED_USER = ''
     SHARED_CREDENTIALS_FILE = ''
+    SERVICE_ACCOUNT = 'iam.gserviceaccount.com'
+    METADATA_SERVICE_ACCOUNT = 'metadata_service_account'
+    EXTERNAL_ACCOUNT = 'external_account'
+    IMPERSONATED_SERVICE_ACCOUNT = 'impersonated_service_account'
+    UNKNOWN = 'unknown'
 
     def can_credential_expire(self) -> bool:
-        return self == GCPIdentityType.SHARED_CREDENTIALS_FILE
+        # Metadata and service-account key credentials can continuously mint
+        # access tokens without an interactive user session.  For all other
+        # credential chains, be conservative: authorized-user sessions can be
+        # revoked/expire, external providers can stop issuing subject tokens,
+        # and impersonated credentials can inherit either kind of source.
+        return self not in {
+            GCPIdentityType.SERVICE_ACCOUNT,
+            GCPIdentityType.METADATA_SERVICE_ACCOUNT,
+        }
 
 
 @registry.CLOUD_REGISTRY.register
@@ -260,12 +287,15 @@ class GCP(clouds.Cloud):
         region: Optional[str] = None,
     ) -> Dict[clouds.CloudImplementationFeatures, str]:
         unsupported = {}
-        if gcp_utils.is_tpu_vm_pod(resources):
+        is_compute_tpu = _is_compute_tpu_instance_type(resources.instance_type)
+        if gcp_utils.is_tpu_vm_pod(resources) or is_compute_tpu:
             unsupported = {
-                clouds.CloudImplementationFeatures.STOP: (
-                    'TPU VM pods cannot be stopped. Please refer to: '
-                    'https://cloud.google.com/tpu/docs/managing-tpus-tpu-vm#stopping_your_resources'
-                )
+                clouds.CloudImplementationFeatures.STOP:
+                    ('TPU VMs cannot be stopped. Delete them instead. Please '
+                     'refer to: https://cloud.google.com/tpu/docs/'
+                     'managing-tpus-compute'),
+                clouds.CloudImplementationFeatures.AUTOSTOP:
+                    ('TPU VMs cannot be autostopped. Use autodown instead.'),
             }
         if gcp_utils.is_tpu(resources) and not gcp_utils.is_tpu_vm(resources):
             # TPU node does not support multi-node.
@@ -275,17 +305,17 @@ class GCP(clouds.Cloud):
         # TODO(zhwu): We probably need to store the MIG requirement in resources
         # because `skypilot_config` may change for an existing cluster.
         # Clusters created with MIG cannot be stopped.
-        is_compute_tpu = (resources.instance_type is not None and
-                          resources.instance_type.startswith(
-                              _COMPUTE_TPU_MACHINE_TYPE_PREFIXES))
         if (skypilot_config.get_effective_region_config(
                 cloud='gcp',
                 region=resources.region,
                 keys=('managed_instance_group',),
                 override_configs=resources.cluster_config_overrides) is not None
-                and (resources.accelerators or is_compute_tpu)):
+                and _is_managed_instance_group_eligible(resources)):
             unsupported[clouds.CloudImplementationFeatures.STOP] = (
                 'Managed Instance Group (MIG) does not support stopping yet.')
+            unsupported[clouds.CloudImplementationFeatures.AUTOSTOP] = (
+                'Managed Instance Group (MIG) does not support autostop. Use '
+                'autodown instead.')
             unsupported[clouds.CloudImplementationFeatures.SPOT_INSTANCE] = (
                 'Managed Instance Group with DWS does not support '
                 'spot instances.')
@@ -433,6 +463,27 @@ class GCP(clouds.Cloud):
                                        region=region,
                                        zone=zone,
                                        clouds='gcp')
+
+    def resources_to_hourly_cost(self, resources: 'resources.Resources',
+                                 region: Optional[str],
+                                 zone: Optional[str]) -> float:
+        hourly_cost = super().resources_to_hourly_cost(resources, region, zone)
+        if not _is_compute_tpu_instance_type(resources.instance_type):
+            return hourly_cost
+        managed_instance_group_config = (
+            skypilot_config.get_effective_region_config(
+                cloud='gcp',
+                region=region,
+                keys=('managed_instance_group',),
+                default_value=None,
+                override_configs=resources.cluster_config_overrides))
+        if managed_instance_group_config is None:
+            return hourly_cost
+        # Google's published DWS Flex-start price is 50% of on-demand for the
+        # Compute TPU generations currently exposed here.  Keep the base
+        # catalog price on-demand because these machine types can also launch
+        # without a managed instance group.
+        return hourly_cost * _COMPUTE_TPU_FLEX_START_PRICE_FACTOR
 
     def accelerators_to_hourly_cost(self,
                                     accelerators: Dict[str, int],
@@ -608,9 +659,7 @@ class GCP(clouds.Cloud):
                     _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[1]):
                 image_id = _DEFAULT_TPU7X_IMAGE_ID
         # Find GPU spec, if any.
-        is_compute_tpu = (
-            r.instance_type is not None and
-            r.instance_type.startswith(_COMPUTE_TPU_MACHINE_TYPE_PREFIXES))
+        is_compute_tpu = _is_compute_tpu_instance_type(r.instance_type)
         resources_vars = {
             'instance_type': r.instance_type,
             'region': region_name,
@@ -621,6 +670,12 @@ class GCP(clouds.Cloud):
             'tpu_vm': False,
             'custom_resources': None,
             'use_spot': r.use_spot,
+            'is_compute_tpu': is_compute_tpu,
+            # CT6e 8-chip VMs require single-threaded cores.  Keep this in
+            # node_config so both direct VM and regional MIG launches use the
+            # same Compute Engine setting.
+            'threads_per_core': 1 if r.instance_type
+                                in _CT6E_EIGHT_CHIP_MACHINE_TYPES else None,
             'gcp_project_id': self.get_project_id(dryrun),
             **GCP._get_disk_specs(
                 r.instance_type,
@@ -724,8 +779,10 @@ class GCP(clouds.Cloud):
             keys=('managed_instance_group',),
             default_value=None,
             override_configs=resources.cluster_config_overrides)
-        use_mig = managed_instance_group_config is not None
+        use_mig = (managed_instance_group_config is not None and
+                   _is_managed_instance_group_eligible(r))
         resources_vars['gcp_use_managed_instance_group'] = use_mig
+        resources_vars['gcp_is_tpu_mig'] = use_mig and is_compute_tpu
         # Convert boolean to 0 or 1 in string, as GCP does not support boolean
         # value in labels for TPU VM APIs.
         resources_vars['gcp_use_managed_instance_group_value'] = str(
@@ -934,11 +991,33 @@ class GCP(clouds.Cloud):
                     f'{_GCP_APPLICATION_CREDENTIAL_ENV}={application_key_path},'
                     ' but the file does not exist.')
             return application_key_path
-        if (not os.path.isfile(
-                os.path.expanduser(DEFAULT_GCP_APPLICATION_CREDENTIAL_PATH))):
+        application_key_path = os.path.join(
+            cls._get_local_gcloud_config_dir(),
+            os.path.basename(DEFAULT_GCP_APPLICATION_CREDENTIAL_PATH))
+        if not os.path.isfile(application_key_path):
             # Fallback to the default application credential path.
-            raise FileNotFoundError(DEFAULT_GCP_APPLICATION_CREDENTIAL_PATH)
-        return DEFAULT_GCP_APPLICATION_CREDENTIAL_PATH
+            raise FileNotFoundError(application_key_path)
+        return application_key_path
+
+    @staticmethod
+    def _get_local_gcloud_config_dir(source_root: Optional[str] = None) -> str:
+        """Resolve and validate the local gcloud configuration directory."""
+        if source_root is None:
+            source_root = os.environ.get('CLOUDSDK_CONFIG')
+            if source_root is None:
+                source_root = _GCLOUD_CONFIG_DIR
+        if not source_root.strip():
+            raise exceptions.CloudUserIdentityError(
+                'The local gcloud configuration directory is empty. Check '
+                '`CLOUDSDK_CONFIG` and retry.')
+        source_root = os.path.abspath(
+            os.path.expanduser(os.path.expandvars(source_root)))
+        if not os.path.isdir(source_root):
+            raise exceptions.CloudUserIdentityError(
+                'The local gcloud configuration directory does not exist or '
+                f'is not a directory: {source_root!r}. Check '
+                '`CLOUDSDK_CONFIG` and retry.')
+        return source_root
 
     @classmethod
     def _check_compute_credentials(
@@ -983,20 +1062,19 @@ class GCP(clouds.Cloud):
                 f'{common_utils.format_exception(e, use_bracket=True)}')
 
         identity_type = cls._get_identity_type()
-        if identity_type == GCPIdentityType.SHARED_CREDENTIALS_FILE:
-            # This files are only required when using the shared credentials
+        if identity_type == GCPIdentityType.AUTHORIZED_USER:
+            # These files are only required when using the shared credentials
             # to access GCP. They are not required when using service account.
             try:
                 # These files are required because they will be synced to remote
                 # VMs for `gsutil` to access private storage buckets.
                 # `auth.default()` does not guarantee these files exist.
-                for file in [
-                        '~/.config/gcloud/access_tokens.db',
-                        '~/.config/gcloud/credentials.db',
-                ]:
-                    if not os.path.isfile(os.path.expanduser(file)):
-                        raise FileNotFoundError(file)
-            except FileNotFoundError as e:
+                gcloud_config_dir = cls._get_local_gcloud_config_dir()
+                for filename in ('access_tokens.db', 'credentials.db'):
+                    credential_path = os.path.join(gcloud_config_dir, filename)
+                    if not os.path.isfile(credential_path):
+                        raise FileNotFoundError(credential_path)
+            except (FileNotFoundError, exceptions.CloudUserIdentityError) as e:
                 return False, (
                     f'Credentials are not set. '
                     f'{cls._CREDENTIAL_HINT}\n'
@@ -1016,7 +1094,7 @@ class GCP(clouds.Cloud):
             # Check if application default credentials are set.
             project_id = cls.get_project_id()
 
-            # Check if the user is activated.
+            # This identity is derived from the same ADC used for API calls.
             identity = cls.get_active_user_identity()
         except (auth.exceptions.DefaultCredentialsError,
                 exceptions.CloudUserIdentityError) as e:
@@ -1028,6 +1106,48 @@ class GCP(clouds.Cloud):
                 f'{cls._CREDENTIAL_HINT[1:]}\n'
                 f'{cls._INDENT_PREFIX}Details: '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
+
+        try:
+            # Some GCP paths still invoke gcloud (for example Service Usage
+            # and OS Login).  Do not allow those commands to silently run as a
+            # different principal from the ADC-backed API clients.
+            gcloud_account = cls._get_active_gcloud_account()
+        except exceptions.CloudUserIdentityError as e:
+            return False, (
+                'Getting the effective gcloud account failed. '
+                f'{cls._CREDENTIAL_HINT}\n'
+                f'{cls._INDENT_PREFIX}Details: '
+                f'{common_utils.format_exception(e, use_bracket=True)}')
+
+        if gcloud_account is not None:
+            assert identity is not None
+            project_suffix = f' [project_id={project_id}]'
+            adc_account = identity[0]
+            if adc_account.endswith(project_suffix):
+                adc_account = adc_account[:-len(project_suffix)]
+            # Workforce owner identities include a pool/provider-bound subject
+            # digest to avoid collisions. gcloud exposes only the verified
+            # email for that credential, so compare that email while retaining
+            # the full identity for SkyPilot ownership checks.
+            workforce_suffix = ' [workforce_subject='
+            gcloud_comparable_adc_account = adc_account
+            if workforce_suffix in gcloud_comparable_adc_account:
+                gcloud_comparable_adc_account = (
+                    gcloud_comparable_adc_account.split(workforce_suffix,
+                                                        maxsplit=1)[0])
+            if (gcloud_account.casefold() !=
+                    gcloud_comparable_adc_account.casefold()):
+                return False, (
+                    'The active gcloud account and Application Default '
+                    'Credentials (ADC) authorize as different users:\n'
+                    f'    gcloud: {gcloud_account}\n'
+                    f'    ADC:    {adc_account}\n'
+                    'SkyPilot uses ADC for Google Cloud API calls and the '
+                    'gcloud credential store for CLI operations. Sign in both '
+                    'as the same principal. For user credentials, run `gcloud '
+                    'auth login` and `gcloud auth application-default login`. '
+                    'For service-account credentials, activate the same '
+                    'service account in gcloud.')
 
         # This takes user's credential info from "~/.config/gcloud/application_default_credentials.json".  # pylint: disable=line-too-long
         credentials, project = _get_default()
@@ -1100,48 +1220,485 @@ class GCP(clouds.Cloud):
 
         return True, None
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
-        # Excluding the symlink to the python executable created by the gcp
-        # credential, which causes problem for ray up multiple nodes, tracked
-        # in #494, #496, #483.
-        # We only add the existing credential files. It should be safe to ignore
-        # the missing files, as we have checked the cloud credentials in
-        # `check_credentials()` when the user calls `sky check`.
-        credentials = {
-            f'~/.config/gcloud/{filename}': f'~/.config/gcloud/{filename}'
-            for filename in _CREDENTIAL_FILES
-            if os.path.exists(os.path.expanduser(
-                f'~/.config/gcloud/{filename}'))
+    @staticmethod
+    def _stage_gcloud_database(source_path: str, destination_path: str,
+                               table: str, columns: Tuple[str, ...],
+                               accounts: Tuple[str, ...]) -> int:
+        """Copy only selected account rows into a fresh SQLite database.
+
+        Copying a gcloud database and deleting rows is insufficient because
+        SQLite freelist pages can retain deleted refresh tokens. Build a new
+        database so credentials for inactive local accounts never enter the
+        staged file.
+        """
+        placeholders = ','.join('?' for _ in accounts)
+        column_list = ', '.join(columns)
+        source_uri = f'file:{source_path}?mode=ro'
+        with sqlite3.connect(source_uri, uri=True) as source:
+            rows = source.execute(
+                f'SELECT {column_list} FROM {table} '
+                f'WHERE account_id IN ({placeholders})', accounts).fetchall()
+
+        destination_dir = os.path.dirname(destination_path)
+        os.makedirs(destination_dir, mode=0o700, exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f'.{os.path.basename(destination_path)}.',
+            dir=destination_dir)
+        os.close(file_descriptor)
+        try:
+            with sqlite3.connect(temporary_path) as destination:
+                if table == 'credentials':
+                    destination.execute(
+                        'CREATE TABLE credentials '
+                        '(account_id TEXT PRIMARY KEY, value BLOB)')
+                elif table == 'access_tokens':
+                    destination.execute(
+                        'CREATE TABLE access_tokens '
+                        '(account_id TEXT PRIMARY KEY, access_token TEXT, '
+                        'token_expiry TIMESTAMP, rapt_token TEXT, '
+                        'id_token TEXT)')
+                else:
+                    raise ValueError(f'Unsupported gcloud table: {table!r}')
+                if rows:
+                    value_placeholders = ','.join('?' for _ in columns)
+                    destination.executemany(
+                        f'INSERT INTO {table} ({column_list}) '
+                        f'VALUES ({value_placeholders})', rows)
+            os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, destination_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        return len(rows)
+
+    @classmethod
+    def _stage_gcloud_cli_credentials(
+            cls,
+            base_account: str,
+            effective_account: str,
+            source_root: Optional[str] = None,
+            staging_root: Optional[str] = None) -> Dict[str, str]:
+        """Stage a single-principal gcloud configuration for remote upload."""
+        source_root = cls._get_local_gcloud_config_dir(source_root)
+        active_config = os.environ.get('CLOUDSDK_ACTIVE_CONFIG_NAME')
+        if not active_config:
+            active_config_path = os.path.join(source_root, 'active_config')
+            active_config = 'default'
+            if os.path.isfile(active_config_path):
+                with open(active_config_path, encoding='utf-8') as file:
+                    active_config = file.read().strip()
+        if re.fullmatch(r'[A-Za-z0-9_-]+', active_config) is None:
+            raise exceptions.CloudUserIdentityError(
+                f'Invalid active gcloud configuration: {active_config!r}.')
+        source_config = os.path.join(source_root, 'configurations',
+                                     f'config_{active_config}')
+        if not os.path.isfile(source_config):
+            raise exceptions.CloudUserIdentityError(
+                'The selected gcloud configuration file does not exist: '
+                f'{source_config!r}. Check `CLOUDSDK_ACTIVE_CONFIG_NAME` and '
+                'the active gcloud configuration, then retry.')
+
+        staging_key = hashlib.sha256(
+            (f'{os.path.realpath(source_root)}\0{active_config}\0'
+             f'{base_account}\0{effective_account}').encode()).hexdigest()[:16]
+        if staging_root is None:
+            staging_root = os.path.expanduser(_STAGED_GCLOUD_CONFIG_DIR)
+        staged_root = os.path.join(staging_root, staging_key)
+        staged_configurations = os.path.join(staged_root, 'configurations')
+        os.makedirs(staged_configurations, mode=0o700, exist_ok=True)
+
+        parser = configparser.RawConfigParser()
+        with open(source_config, encoding='utf-8') as file:
+            parser.read_file(file)
+        if not parser.has_section('core'):
+            parser.add_section('core')
+        parser.set('core', 'account', base_account)
+        if not parser.has_section('auth'):
+            parser.add_section('auth')
+        for option in ('access_token_file', 'credential_file_override',
+                       'login_config_file'):
+            parser.remove_option('auth', option)
+        impersonated_account = cls._get_configured_gcloud_impersonation()
+        if impersonated_account is None:
+            parser.remove_option('auth', 'impersonate_service_account')
+        else:
+            if (impersonated_account.casefold() !=
+                    effective_account.casefold()):
+                raise exceptions.CloudUserIdentityError(
+                    'The configured gcloud impersonation target changed while '
+                    'staging credentials. Re-run the command.')
+            parser.set('auth', 'impersonate_service_account',
+                       impersonated_account)
+
+        staged_config = os.path.join(staged_configurations,
+                                     f'config_{active_config}')
+        file_descriptor, temporary_config = tempfile.mkstemp(
+            prefix='.config.', dir=staged_configurations, text=True)
+        try:
+            with os.fdopen(file_descriptor, 'w', encoding='utf-8') as file:
+                parser.write(file)
+            os.chmod(temporary_config, 0o600)
+            os.replace(temporary_config, staged_config)
+        finally:
+            if os.path.exists(temporary_config):
+                os.remove(temporary_config)
+
+        staged_active_config = os.path.join(staged_root, 'active_config')
+        file_descriptor, temporary_active_config = tempfile.mkstemp(
+            prefix='.active_config.', dir=staged_root, text=True)
+        try:
+            with os.fdopen(file_descriptor, 'w', encoding='utf-8') as file:
+                # gcloud treats every byte in this file as part of the
+                # configuration name; a trailing newline makes it look for
+                # `config_default\n`.
+                file.write(active_config)
+            os.chmod(temporary_active_config, 0o600)
+            os.replace(temporary_active_config, staged_active_config)
+        finally:
+            if os.path.exists(temporary_active_config):
+                os.remove(temporary_active_config)
+
+        mounts = {
+            f'{_GCLOUD_CONFIG_DIR}/configurations': staged_configurations,
+            f'{_GCLOUD_CONFIG_DIR}/active_config': staged_active_config,
         }
+        database_specs = {
+            'credentials.db': (
+                'credentials',
+                ('account_id', 'value'),
+                (base_account,),
+            ),
+            'access_tokens.db': (
+                'access_tokens',
+                ('account_id', 'access_token', 'token_expiry', 'rapt_token',
+                 'id_token'),
+                tuple(dict.fromkeys((base_account, effective_account))),
+            ),
+        }
+        for filename, (table, columns, accounts) in database_specs.items():
+            source_path = os.path.join(source_root, filename)
+            if not os.path.isfile(source_path):
+                continue
+            staged_path = os.path.join(staged_root, filename)
+            row_count = cls._stage_gcloud_database(source_path, staged_path,
+                                                   table, columns, accounts)
+            if filename == 'credentials.db' and row_count == 0:
+                raise exceptions.CloudUserIdentityError(
+                    'The active gcloud account has no stored credential row. '
+                    'Run `gcloud auth login` again before uploading local '
+                    'credentials.')
+            mounts[f'{_GCLOUD_CONFIG_DIR}/{filename}'] = staged_path
+        if f'{_GCLOUD_CONFIG_DIR}/credentials.db' not in mounts:
+            raise exceptions.CloudUserIdentityError(
+                'The active gcloud account does not have a portable credential '
+                'database. SkyPilot cannot upload ADC as a substitute because '
+                'gcloud does not use ADC. Activate the same account with '
+                '`gcloud auth login` (or `gcloud auth activate-service-account` '
+                'for a service-account key), then retry.')
+        return mounts
+
+    def get_credential_file_mounts(self) -> Dict[str, str]:
+        # Credential mount collection is called while inspecting all clouds.
+        # Invalid or non-portable ADC therefore fails closed with no mounts;
+        # `sky check gcp` provides the actionable authentication error.
+        try:
+            adc_credentials, _ = _get_default()
+            identity_type = self._get_identity_type_from_credentials(
+                adc_credentials)
+        except Exception:  # pylint: disable=broad-except
+            return {}
+
+        portable_identity_types = {
+            GCPIdentityType.AUTHORIZED_USER,
+            GCPIdentityType.SERVICE_ACCOUNT,
+            GCPIdentityType.IMPERSONATED_SERVICE_ACCOUNT,
+        }
+        if identity_type not in portable_identity_types:
+            return {}
+        if identity_type == GCPIdentityType.IMPERSONATED_SERVICE_ACCOUNT:
+            source = getattr(adc_credentials, '_source_credentials', None)
+            if (source is None or
+                    self._get_identity_type_from_credentials(source)
+                    == GCPIdentityType.EXTERNAL_ACCOUNT):
+                # External-account source files and executable/URL providers
+                # are not safely portable to an arbitrary remote VM.
+                return {}
+
+        adc_account = self._get_adc_principal(adc_credentials, identity_type)
+        gcloud_account = self._get_active_gcloud_account()
+        if gcloud_account.casefold() != adc_account.casefold():
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.CloudUserIdentityError(
+                    'Refusing to upload GCP credentials because the effective '
+                    f'gcloud account ({gcloud_account}) differs from ADC '
+                    f'({adc_account}). Re-run `sky check gcp` after signing '
+                    'both in as the same principal.')
+
+        base_account = self._get_active_gcloud_base_account()
+        credentials = self._stage_gcloud_cli_credentials(
+            base_account, gcloud_account)
         try:
             application_key_path = self._find_application_key_path()
-            # Upload the application key path to the default path, so that
-            # autostop and GCS can be accessed on the remote cluster.
+            # Upload ADC for SDK calls. The isolated gcloud store above makes
+            # CLI and gsutil calls use the same effective principal without
+            # exposing credentials for other locally cached accounts.
             credentials[DEFAULT_GCP_APPLICATION_CREDENTIAL_PATH] = (
                 application_key_path)
         except FileNotFoundError:
-            # Skip if the application key path is not found.
             pass
         return credentials
 
-    @annotations.lru_cache(scope='global', maxsize=1)
+    @annotations.lru_cache(scope='request', maxsize=1)
     def can_credential_expire(self) -> bool:
-        identity_type = self._get_identity_type()
-        return (identity_type is not None and
-                identity_type.can_credential_expire())
+        try:
+            credentials, _ = _get_default()
+        except Exception:  # pylint: disable=broad-except
+            return True
+        return self._credentials_can_expire(credentials)
+
+    @classmethod
+    def _credentials_can_expire(cls,
+                                credentials: Any,
+                                _seen: Optional[Set[int]] = None) -> bool:
+        """Whether a credential chain depends on a revocable user session."""
+        if _seen is None:
+            _seen = set()
+        credential_id = id(credentials)
+        if credential_id in _seen:
+            return True
+        _seen.add(credential_id)
+
+        identity_type = cls._get_identity_type_from_credentials(credentials)
+        if identity_type == GCPIdentityType.IMPERSONATED_SERVICE_ACCOUNT:
+            source = getattr(credentials, '_source_credentials', None)
+            if source is None:
+                return True
+            return cls._credentials_can_expire(source, _seen)
+        # An unrecognized credential chain must not suppress warnings about
+        # long-lived controllers.
+        return identity_type.can_credential_expire()
 
     @classmethod
     def _get_identity_type(cls) -> Optional[GCPIdentityType]:
         try:
-            account = cls.get_active_user_identity()
+            credentials, _ = _get_default()
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return cls._get_identity_type_from_credentials(credentials)
+
+    @staticmethod
+    def _get_identity_type_from_credentials(
+            credentials: Any) -> GCPIdentityType:
+        """Classifies the credential object returned by google.auth.default().
+
+        Class names are used instead of importing every google-auth credential
+        module.  This keeps GCP an optional dependency and works for external
+        account subclasses (AWS, identity-pool, and pluggable credentials).
+        """
+        credential_classes = {
+            f'{base.__module__}.{base.__name__}'
+            for base in type(credentials).__mro__
+        }
+        if ('google.oauth2.credentials.Credentials' in credential_classes):
+            return GCPIdentityType.AUTHORIZED_USER
+        if ('google.auth.external_account_authorized_user.Credentials'
+                in credential_classes):
+            return GCPIdentityType.EXTERNAL_ACCOUNT
+        if ('google.auth.impersonated_credentials.Credentials'
+                in credential_classes):
+            return GCPIdentityType.IMPERSONATED_SERVICE_ACCOUNT
+        if ('google.auth.external_account.Credentials' in credential_classes):
+            return GCPIdentityType.EXTERNAL_ACCOUNT
+        if (credential_classes.intersection({
+                'google.auth.compute_engine.credentials.Credentials',
+                'google.auth.app_engine.Credentials',
+        })):
+            return GCPIdentityType.METADATA_SERVICE_ACCOUNT
+        if (credential_classes.intersection({
+                'google.oauth2.service_account.Credentials',
+                'google.oauth2.gdch_credentials.ServiceAccountCredentials',
+        })):
+            return GCPIdentityType.SERVICE_ACCOUNT
+        return GCPIdentityType.UNKNOWN
+
+    @classmethod
+    def _get_adc_principal(cls, credentials: Any,
+                           identity_type: GCPIdentityType) -> str:
+        """Returns the effective principal represented by an ADC object."""
+
+        def _validate_principal(principal: Any) -> str:
+            if not isinstance(principal, str) or not principal:
+                raise exceptions.CloudUserIdentityError(
+                    'GCP returned an empty credential principal.')
+            if (principal != principal.strip() or len(principal) > 2048 or
+                    any(ord(char) < 32 for char in principal)):
+                raise exceptions.CloudUserIdentityError(
+                    'GCP returned an invalid credential principal.')
+            return principal
+
+        is_external_user = False
+        if identity_type == GCPIdentityType.EXTERNAL_ACCOUNT:
+            try:
+                is_external_user = bool(getattr(credentials, 'is_user', False))
+            except Exception:  # pylint: disable=broad-except
+                is_external_user = False
+
+        if (identity_type == GCPIdentityType.AUTHORIZED_USER or
+                is_external_user):
+            # The account field in an ADC JSON file is user-editable metadata;
+            # verify the subject with an access token minted by the credential.
+            try:
+                oauth2 = gcp.build('oauth2',
+                                   'v2',
+                                   credentials=credentials,
+                                   cache_discovery=False)
+                user_info = oauth2.userinfo().get().execute(num_retries=3)
+                verified_email = _validate_principal(user_info.get('email'))
+                account = verified_email
+                if is_external_user:
+                    # Email alone is not globally unique across workforce
+                    # pools. Bind the owner identity to the token subject and
+                    # audience returned/used by this credential chain.
+                    subject = _validate_principal(
+                        user_info.get('id') or user_info.get('sub'))
+                    audience = _validate_principal(
+                        getattr(credentials, 'audience', None) or
+                        getattr(credentials, '_audience', None))
+                    subject_digest = hashlib.sha256(
+                        f'{audience}\0{subject}'.encode()).hexdigest()
+                    account = (f'{verified_email} '
+                               f'[workforce_subject={subject_digest}]')
+            except Exception as e:  # pylint: disable=broad-except
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.CloudUserIdentityError(
+                        'Application Default Credentials could not verify '
+                        'their user with the Google OAuth userinfo endpoint. '
+                        'Re-authenticate ADC with an email/userinfo scope or '
+                        'use service-account impersonation.\n'
+                        '  Reason: '
+                        f'{common_utils.format_exception(e, use_bracket=True)}'
+                    ) from e
+
+            account_hint = getattr(credentials, 'account', None)
+            if (isinstance(account_hint, str) and account_hint and
+                    account_hint.casefold() != verified_email.casefold()):
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.CloudUserIdentityError(
+                        'The account recorded in the ADC file does not match '
+                        'the OAuth subject. Recreate ADC with `gcloud auth '
+                        'application-default login`.')
+            return account
+
+        service_account_email = getattr(credentials, 'service_account_email',
+                                        None)
+        if (isinstance(service_account_email, str) and
+                service_account_email not in ('', 'default')):
+            return _validate_principal(service_account_email)
+
+        if identity_type == GCPIdentityType.METADATA_SERVICE_ACCOUNT:
+            try:
+                # Compute credentials initially expose the placeholder
+                # "default"; refresh resolves the actual metadata identity.
+                # google-auth is an optional GCP dependency.
+                # pylint: disable=import-outside-toplevel
+                from google.auth.transport import requests as auth_requests
+                credentials.refresh(auth_requests.Request())
+                service_account_email = credentials.service_account_email
+            except Exception as e:  # pylint: disable=broad-except
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.CloudUserIdentityError(
+                        'Failed to resolve the GCP metadata service account.\n'
+                        '  Reason: '
+                        f'{common_utils.format_exception(e, use_bracket=True)}'
+                    ) from e
+            if service_account_email not in ('', 'default', None):
+                return _validate_principal(service_account_email)
+
+        if identity_type == GCPIdentityType.EXTERNAL_ACCOUNT:
+            # A pool/provider audience is shared by multiple subjects and must
+            # never be used as an owner identity.  Direct workload federation
+            # does not expose a verified mapped subject through google-auth.
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.CloudUserIdentityError(
+                    'SkyPilot cannot safely determine a unique principal for '
+                    'direct external-account ADC. Configure service-account '
+                    'impersonation (or a workforce user credential whose OAuth '
+                    'userinfo includes both a stable subject and an email).')
+
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.CloudUserIdentityError(
+                'SkyPilot could not determine the principal represented by '
+                'Application Default Credentials '
+                f'({identity_type.name.lower()}).')
+
+    @classmethod
+    def _get_configured_gcloud_impersonation(cls) -> Optional[str]:
+        try:
+            impersonated_account = _run_output(
+                'gcloud config get-value auth/impersonate_service_account '
+                '--quiet').strip()
+        except subprocess.CalledProcessError:
+            return None
+        if impersonated_account and impersonated_account != '(unset)':
+            return impersonated_account
+        return None
+
+    @classmethod
+    def _get_active_gcloud_base_account(cls) -> str:
+        """Returns the credentialed gcloud account before impersonation."""
+        try:
+            account = _run_output('gcloud auth list --filter=status:ACTIVE '
+                                  '--format="value(account)"').strip()
+        except subprocess.CalledProcessError as e:
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.CloudUserIdentityError(
+                    'Failed to get the active gcloud account.\n'
+                    '  Reason: '
+                    f'{common_utils.format_exception(e, use_bracket=True)}'
+                ) from e
+        if not account:
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.CloudUserIdentityError(
+                    'No GCP account is activated in gcloud. Run `gcloud auth '
+                    'login` and verify `gcloud auth list '
+                    '--filter=status:ACTIVE --format="value(account)"`.')
+        return account
+
+    @classmethod
+    def _get_active_gcloud_account(cls) -> str:
+        """Returns gcloud's effective account, including impersonation."""
+        impersonated_account = cls._get_configured_gcloud_impersonation()
+        if impersonated_account is not None:
+            return impersonated_account
+        return cls._get_active_gcloud_base_account()
+
+    @classmethod
+    def _get_legacy_impersonation_source_principal(
+            cls, credentials: Any) -> Optional[str]:
+        """Returns a verified pre-ADC owner identity for compatibility.
+
+        Older SkyPilot versions stored the active source gcloud account even
+        when API calls used an impersonated service account. Expose that source
+        as a secondary identity only when google-auth provides and verifies the
+        exact source credential object.
+        """
+        if (cls._get_identity_type_from_credentials(credentials) !=
+                GCPIdentityType.IMPERSONATED_SERVICE_ACCOUNT):
+            return None
+        source = getattr(credentials, '_source_credentials', None)
+        if source is None:
+            return None
+        source_type = cls._get_identity_type_from_credentials(source)
+        if source_type not in {
+                GCPIdentityType.AUTHORIZED_USER,
+                GCPIdentityType.SERVICE_ACCOUNT,
+                GCPIdentityType.METADATA_SERVICE_ACCOUNT,
+        }:
+            return None
+        try:
+            return cls._get_adc_principal(source, source_type)
         except exceptions.CloudUserIdentityError:
             return None
-        if account is None:
-            return None
-        assert account is not None
-        if GCPIdentityType.SERVICE_ACCOUNT.value in account[0]:
-            return GCPIdentityType.SERVICE_ACCOUNT
-        return GCPIdentityType.SHARED_CREDENTIALS_FILE
 
     @classmethod
     def get_user_identities(cls) -> List[List[str]]:
@@ -1160,24 +1717,17 @@ class GCP(clouds.Cloud):
         del workspace_config  # Unused
 
         try:
-            account = _run_output('gcloud auth list --filter=status:ACTIVE '
-                                  '--format="value(account)"')
-            account = account.strip()
-        except subprocess.CalledProcessError as e:
-            with ux_utils.print_exception_no_traceback():
-                raise exceptions.CloudUserIdentityError(
-                    f'Failed to get GCP user identity with unknown '
-                    f'exception.\n'
-                    '  Reason: '
-                    f'{common_utils.format_exception(e, use_bracket=True)}'
-                ) from e
-        if not account:
-            with ux_utils.print_exception_no_traceback():
-                raise exceptions.CloudUserIdentityError(
-                    'No GCP account is activated. Try running `gcloud '
-                    'auth list --filter=status:ACTIVE '
-                    '--format="value(account)"` and ensure it correctly '
-                    'returns the current user.')
+            credentials, _ = _get_default()
+        except ImportError:
+            # Preserve identity inspection in minimal installations.  Cloud
+            # credential checks will still report google-auth as missing.
+            account = cls._get_active_gcloud_account()
+            legacy_account = None
+        else:
+            identity_type = cls._get_identity_type_from_credentials(credentials)
+            account = cls._get_adc_principal(credentials, identity_type)
+            legacy_account = cls._get_legacy_impersonation_source_principal(
+                credentials)
         try:
             project_id = cls.get_project_id()
         except Exception as e:  # pylint: disable=broad-except
@@ -1188,10 +1738,11 @@ class GCP(clouds.Cloud):
                     '  Reason: '
                     f'{common_utils.format_exception(e, use_bracket=True)}'
                 ) from e
-        # TODO: Return a list of identities in the profile when we support
-        # automatic switching for GCP. Currently we only support one
-        # identity.
-        return [[f'{account} [project_id={project_id}]']]
+        identities = [[f'{account} [project_id={project_id}]']]
+        if (legacy_account is not None and
+                legacy_account.casefold() != account.casefold()):
+            identities.append([f'{legacy_account} [project_id={project_id}]'])
+        return identities
 
     @classmethod
     def get_active_user_identity_str(cls) -> Optional[str]:
@@ -1212,7 +1763,8 @@ class GCP(clouds.Cloud):
         # See: https://cloud.google.com/tpu/docs/preemptible#tpu-vm
         # On-demand TPU VMs are likely to require manual cleanup as well.
 
-        return gcp_utils.is_tpu_vm(resources)
+        return (gcp_utils.is_tpu_vm(resources) or
+                _is_compute_tpu_instance_type(resources.instance_type))
 
     @classmethod
     def get_project_id(cls, dryrun: bool = False) -> str:
@@ -1474,7 +2026,8 @@ class GCP(clouds.Cloud):
                 keys=('managed_instance_group',),
                 default_value=None,
                 override_configs=resources.cluster_config_overrides))
-        if managed_instance_group_config is not None:
+        if (managed_instance_group_config is not None and
+                _is_managed_instance_group_eligible(resources)):
             # Flex-start VMs use DWS. GCP documents that these requests consume
             # preemptible quota once a project has requested preemptible quota;
             # projects that have never requested preemptible quota may consume

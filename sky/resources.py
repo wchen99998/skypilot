@@ -1835,10 +1835,11 @@ class Resources:
         assert self.cloud is not None, 'Cloud must be specified'
         assert self._instance_type is not None, (
             'Instance type must be specified')
-        # Instance.
+        if isinstance(self.cloud, clouds.Cloud):
+            return self.cloud.resources_to_hourly_cost(self, region, zone)
+        # Preserve support for duck-typed cloud implementations.
         hourly_cost = self.cloud.instance_type_to_hourly_cost(
             self._instance_type, self.use_spot, region, zone)
-        # Accelerators (if any).
         if self.accelerators is not None:
             hourly_cost += self.cloud.accelerators_to_hourly_cost(
                 self.accelerators, self.use_spot, region, zone)

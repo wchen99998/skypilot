@@ -310,6 +310,27 @@ class Cloud:
         """Returns the hourly on-demand price for accelerators."""
         raise NotImplementedError
 
+    def resources_to_hourly_cost(self, resources: 'resources_lib.Resources',
+                                 region: Optional[str],
+                                 zone: Optional[str]) -> float:
+        """Returns the total hourly price for a resource configuration.
+
+        Cloud subclasses can override this when the provisioning model is
+        represented by more than ``use_spot`` (for example, GCP Flex-start).
+        """
+        instance_type = resources.instance_type
+        assert instance_type is not None, resources
+        hourly_cost = self.instance_type_to_hourly_cost(instance_type,
+                                                        resources.use_spot,
+                                                        region, zone)
+        if resources.accelerators is not None:
+            # Cloud implementations historically accept integral accelerator
+            # counts, while Resources uses a wider numeric type for parsing.
+            accelerators = typing.cast(Dict[str, int], resources.accelerators)
+            hourly_cost += self.accelerators_to_hourly_cost(
+                accelerators, resources.use_spot, region, zone)
+        return hourly_cost
+
     def get_egress_cost(self, num_gigabytes: float):
         """Returns the egress cost.
 

@@ -199,6 +199,15 @@ def get_minimal_compute_permissions() -> List[str]:
                 default_value=[])):
         permissions += constants.RESERVATION_PERMISSIONS
 
+    managed_instance_group_config = (
+        skypilot_config.get_effective_region_config(
+            cloud='gcp',
+            region=None,
+            keys=('managed_instance_group',),
+            default_value=None))
+    if managed_instance_group_config:
+        permissions += constants.TPU_FLEX_START_MIG_PERMISSIONS
+
     permissions += constants.GCP_MINIMAL_PERMISSIONS
 
     return permissions

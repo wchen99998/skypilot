@@ -1363,7 +1363,10 @@ Compute Engine provisioner. Google currently marks TPU7x Flex-start access as
 contact your Google Cloud account team if the request is rejected for access.
 SkyPilot automatically selects Google's TPU-enabled Ubuntu image for
 ``ct6e-standard-*`` and ``tpu7x-standard-*`` machine types unless ``image_id``
-is set explicitly.
+is set explicitly. When this setting is active for those Compute TPU machine
+types, SkyPilot's estimated cost uses Google's published DWS Flex-start price
+(currently 50% of the corresponding on-demand price). Without this setting,
+the same machine types retain their on-demand estimate.
 
 Default: ``900``.
 
@@ -1406,17 +1409,35 @@ Identity to use for GCP instances (optional).
 
 Please refer to the aws.remote_identity section above for more details.
 
-GCP jobs and serve controllers default to ``SERVICE_ACCOUNT`` when this option
-is not set. The local client still uses local Application Default Credentials
-to create the controller initially. Once the controller is running, Google
-metadata credentials for the attached SkyPilot service account refresh
-automatically, so long-running provisioning and recovery do not depend on a
-user's ``gcloud auth login`` session. Set ``LOCAL_CREDENTIALS`` explicitly to
-retain credential-file upload behavior; uploaded user credentials remain
-subject to any organization session-duration policy.
+Dedicated jobs and serve controllers that run on a GCP VM default to
+``SERVICE_ACCOUNT`` when this option is not set. The API server still uses its
+own Application Default Credentials to create the controller initially. Once
+the controller is running, credentials for its attached SkyPilot service
+account are obtained from the Google metadata server and refresh
+automatically. During setup of any GCP cluster using ``SERVICE_ACCOUNT``,
+SkyPilot also removes active GCP user credential files left by an earlier
+``LOCAL_CREDENTIALS`` launch, unsets the active gcloud account and service
+account impersonation and credential override settings, and verifies metadata
+authentication. Setup fails if a credential environment override would shadow
+the metadata service account. This prevents stale local credentials from
+taking precedence over metadata credentials. Existing clusters receive this
+migration the next time their setup runs (for example, on a restart or
+relaunch).
 
-Default: ``LOCAL_CREDENTIALS`` for ordinary clusters; ``SERVICE_ACCOUNT`` for
-GCP jobs and serve controllers.
+This default does not change the identity used by a remote API server in
+:ref:`consolidation mode <jobs-consolidation-mode>`, nor does it provide a GCP
+identity to a dedicated controller hosted on another cloud. Those processes
+must have their own durable GCP identity. Prefer an attached service account or
+Workload Identity Federation with service account impersonation; use a service
+account JSON key only when a keyless identity is not available.
+
+Set ``LOCAL_CREDENTIALS`` explicitly to retain credential-file upload
+behavior. Uploaded user Application Default Credentials remain subject to
+revocation and any organization session-duration policy.
+
+Default: ``LOCAL_CREDENTIALS`` for ordinary clusters and controllers not
+hosted on GCP; ``SERVICE_ACCOUNT`` for dedicated GCP-hosted jobs and serve
+controllers.
 
 .. _config-yaml-gcp-enable-gvnic:
 

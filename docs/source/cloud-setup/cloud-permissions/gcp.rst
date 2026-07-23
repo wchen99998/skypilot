@@ -163,7 +163,45 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
     tpu.nodes.update
     tpu.operations.get
 
-6. **Optional**: To enable ``sky launch --clone-disk-from``, you need to have the following permissions for the role as well:
+6. **Optional**: To use Compute Engine TPU Flex-start with
+   ``gcp.managed_instance_group``, add the following permissions. SkyPilot
+   checks these permissions before submitting the regional instance template,
+   workload policy, and bulk MIG:
+
+.. code-block:: text
+
+    compute.instanceGroupManagers.create
+    compute.instanceGroupManagers.delete
+    compute.instanceGroupManagers.get
+    compute.instanceGroups.delete
+    compute.instanceTemplates.create
+    compute.instanceTemplates.delete
+    compute.instanceTemplates.get
+    compute.instanceTemplates.useReadOnly
+    compute.regionOperations.get
+    compute.resourcePolicies.create
+    compute.resourcePolicies.delete
+    compute.resourcePolicies.get
+    compute.resourcePolicies.use
+
+.. note::
+
+    ``compute.instanceGroupManagers.get`` also authorizes Google's
+    `listManagedInstances API
+    <https://cloud.google.com/compute/docs/reference/rest/v1/regionInstanceGroupManagers/listManagedInstances>`__.
+    Deleting a MIG requires both manager and backing instance-group delete
+    permissions, as documented by the `regional MIG delete API
+    <https://cloud.google.com/compute/docs/reference/rest/v1/regionInstanceGroupManagers/delete>`__.
+    As an alternative to a custom role, Google's `TPU Flex-start prerequisites
+    <https://cloud.google.com/tpu/docs/create-flex-start-compute#before_you_begin>`__
+    specify ``roles/compute.instanceAdmin.v1`` and
+    ``roles/iam.serviceAccountUser``. The latter is required when the MIG
+    creates VMs that run as a service account. The `Google APIs Service Agent
+    <https://cloud.google.com/compute/docs/access/iam#managed-instance-groups-and-iam>`__
+    must also retain access to resources referenced by the instance template,
+    such as images, networks, and subnets.
+
+7. **Optional**: To enable ``sky launch --clone-disk-from``, you need to have the following permissions for the role as well:
 
 .. code-block:: text
 
@@ -172,7 +210,7 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
     compute.images.get
     compute.images.delete
 
-7. **Optional**: To enable opening ports on GCP cluster, you need to have the following permissions for the role as well:
+8. **Optional**: To enable opening ports on GCP cluster, you need to have the following permissions for the role as well:
 
 .. code-block:: text
 
@@ -180,7 +218,7 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
     compute.firewalls.list
     compute.firewalls.update
 
-8. **Optional**: If the user needs to use custom machine images with ``sky launch --image-id``, you can additionally add the following permissions:
+9. **Optional**: If the user needs to use custom machine images with ``sky launch --image-id``, you can additionally add the following permissions:
 
 .. code-block:: text
 
@@ -189,15 +227,15 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
     compute.images.get
     compute.images.useReadOnly
 
-9. **Optional**: If your organization sets ``gcp.prioritize_reservations`` or ``gcp.specific_reservations`` in :ref:`~/.sky/config.yaml <config-yaml>`, you can additionally add the following permissions:
+10. **Optional**: If your organization sets ``gcp.prioritize_reservations`` or ``gcp.specific_reservations`` in :ref:`~/.sky/config.yaml <config-yaml>`, you can additionally add the following permissions:
 
 .. code-block:: text
 
     compute.reservations.list
 
-9. Click **Create** to create the role.
-10. Go back to the "IAM" tab and click on **GRANT ACCESS**.
-11. Fill in the email address of the user in the “Add principals” section, and select ``minimal-skypilot-role`` in the “Assign roles” section. Click **Save**.
+11. Click **Create** to create the role.
+12. Go back to the "IAM" tab and click on **GRANT ACCESS**.
+13. Fill in the email address of the user in the “Add principals” section, and select ``minimal-skypilot-role`` in the “Assign roles” section. Click **Save**.
 
 
 .. image:: ../../images/screenshots/gcp/create-iam.png
@@ -205,7 +243,7 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
     :align: center
     :alt: GCP Grant Access
 
-12. The user should receive an invitation to the project and should be able to setup SkyPilot by following the instructions in :ref:`Installation <installation-gcp>`.
+14. The user should receive an invitation to the project and should be able to setup SkyPilot by following the instructions in :ref:`Installation <installation-gcp>`.
 
 .. note::
 

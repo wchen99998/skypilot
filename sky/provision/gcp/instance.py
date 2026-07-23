@@ -24,17 +24,49 @@ _INSTANCE_RESOURCE_NOT_FOUND_PATTERN = re.compile(
     r'The resource \'projects/.*/zones/.*/instances/.*\' was not found')
 
 
+def _get_instance_filter_scope(
+    project_id: str,
+    zone: str,
+    cluster_name_on_cloud: str,
+    label_filters: Optional[Dict[str, str]],
+    use_managed_instance_group: bool,
+) -> Tuple[Optional[Dict[str, str]], Optional[List[str]]]:
+    """Return label filters and the authoritative instance-name boundary.
+
+    Labels identify standalone clusters, but they are mutable metadata and
+    cannot establish ownership for a managed instance group.  For a MIG, keep
+    any non-cluster filters (for example, head/worker) only as attributes of
+    instances whose membership was returned by the MIG API.
+    """
+    if not use_managed_instance_group:
+        return label_filters, None
+
+    group_name = mig_utils.get_managed_instance_group_name(
+        cluster_name_on_cloud)
+    included_instances = mig_utils.list_managed_instance_group_instances(
+        project_id, zone, group_name)
+    scoped_label_filters = dict(label_filters or {})
+    scoped_label_filters.pop(provision_constants.TAG_RAY_CLUSTER_NAME, None)
+    return scoped_label_filters or None, included_instances
+
+
 def _filter_instances(
     handlers: Iterable[Type[instance_utils.GCPInstance]],
     project_id: str,
     zone: str,
-    label_filters: Dict[str, str],
+    label_filters: Optional[Dict[str, str]],
     status_filters_fn: Callable[[Type[instance_utils.GCPInstance]],
                                 Optional[List[str]]],
     included_instances: Optional[List[str]] = None,
     excluded_instances: Optional[List[str]] = None,
 ) -> Dict[Type[instance_utils.GCPInstance], List[str]]:
     """Filter instances using all instance handlers."""
+    # An empty inclusion list is an authoritative empty scope, not an omitted
+    # filter.  Short-circuit here so every handler has the same fail-closed
+    # behavior.
+    if included_instances is not None and not included_instances:
+        return {}
+
     instances = set()
     logger.debug(f'handlers: {handlers}')
     for instance_handler in handlers:
@@ -70,25 +102,25 @@ def query_instances(
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     zone = provider_config['availability_zone']
     project_id = provider_config['project_id']
-    included_instances = None
-    if provider_config.get('use_managed_instance_group', False):
-        group_name = mig_utils.get_managed_instance_group_name(
-            cluster_name_on_cloud)
-        included_instances = mig_utils.list_managed_instance_group_instances(
-            project_id, zone, group_name)
-        if not included_instances:
-            return {}
-        label_filters = None
-    else:
-        label_filters = {
-            provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
-        }
+    label_filters, included_instances = _get_instance_filter_scope(
+        project_id,
+        zone,
+        cluster_name_on_cloud,
+        {provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud},
+        provider_config.get('use_managed_instance_group', False),
+    )
+    if included_instances is not None and not included_instances:
+        return {}
 
-    handler: Type[
-        instance_utils.GCPInstance] = instance_utils.GCPComputeInstance
+    use_mig = provider_config.get('use_managed_instance_group', False)
+    handler: Type[instance_utils.GCPInstance]
     use_tpu_vms = provider_config.get('_has_tpus', False)
-    if use_tpu_vms:
+    if use_mig:
+        handler = instance_utils.GCPManagedInstanceGroup
+    elif use_tpu_vms:
         handler = instance_utils.GCPTPUVMInstance
+    else:
+        handler = instance_utils.GCPComputeInstance
 
     instances = handler.filter(
         project_id,
@@ -186,27 +218,44 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     filter_labels = {
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
+    use_managed_instance_group = (resource is
+                                  instance_utils.GCPManagedInstanceGroup)
+
+    def filter_instances(status_filters: Optional[List[str]]) -> Dict[str, Any]:
+        label_filters, included_instances = _get_instance_filter_scope(
+            project_id, availability_zone, cluster_name_on_cloud, filter_labels,
+            use_managed_instance_group)
+        if included_instances is not None and not included_instances:
+            return {}
+        return resource.filter(
+            project_id=project_id,
+            zone=availability_zone,
+            label_filters=label_filters,
+            status_filters=status_filters,
+            included_instances=included_instances,
+        )
+
+    if (resource is instance_utils.GCPManagedInstanceGroup and
+            mig_utils.is_tpu_managed_instance_group(config.node_config)):
+        resource.reconcile_tpu_mig_before_adoption(
+            cluster_name_on_cloud,
+            project_id,
+            availability_zone,
+            config.node_config,
+            labels,
+            total_count=config.count,
+        )
 
     # wait until all stopping instances are stopped/terminated
     while True:
-        instances = resource.filter(
-            project_id=project_id,
-            zone=availability_zone,
-            label_filters=filter_labels,
-            status_filters=resource.STOPPING_STATES,
-        )
+        instances = filter_instances(resource.STOPPING_STATES)
         if not instances:
             break
         logger.info(f'run_instances: Waiting for {len(instances)} instances in '
                     'STOPPING status')
         time.sleep(constants.POLL_INTERVAL)
 
-    exist_instances = resource.filter(
-        project_id=project_id,
-        zone=availability_zone,
-        label_filters=filter_labels,
-        status_filters=None,
-    )
+    exist_instances = filter_instances(None)
     exist_instances = list(exist_instances.values())
     head_instance_id = _get_head_instance_id(exist_instances)
 
@@ -324,12 +373,7 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
 
     while True:
         # wait until all instances are running
-        instances = resource.filter(
-            project_id=project_id,
-            zone=availability_zone,
-            label_filters=filter_labels,
-            status_filters=resource.PENDING_STATES,
-        )
+        instances = filter_instances(resource.PENDING_STATES)
         if not instances:
             break
         logger.debug(f'run_instances: Waiting for {len(instances)} instances '
@@ -337,12 +381,7 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
         time.sleep(constants.POLL_INTERVAL)
 
     # Check if the number of running instances is the same as the requested.
-    instances = resource.filter(
-        project_id=project_id,
-        zone=availability_zone,
-        label_filters=filter_labels,
-        status_filters=[resource.RUNNING_STATE],
-    )
+    instances = filter_instances([resource.RUNNING_STATE])
     if len(instances) != config.count:
         logger.warning('The number of running instances is different from '
                        'the requested number after provisioning '
@@ -422,12 +461,17 @@ def get_cluster_info(
     label_filters = {
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
+    use_mig = provider_config.get('use_managed_instance_group', False)
+    label_filters, included_instances = _get_instance_filter_scope(
+        project_id, zone, cluster_name_on_cloud, label_filters, use_mig)
 
-    handlers: List[Type[instance_utils.GCPInstance]] = [
-        instance_utils.GCPComputeInstance
-    ]
+    handlers: List[Type[instance_utils.GCPInstance]]
+    if use_mig:
+        handlers = [instance_utils.GCPManagedInstanceGroup]
+    else:
+        handlers = [instance_utils.GCPComputeInstance]
     use_tpu_vms = provider_config.get('_has_tpus', False)
-    if use_tpu_vms:
+    if use_tpu_vms and not use_mig:
         handlers.append(instance_utils.GCPTPUVMInstance)
 
     handler_to_instances = _filter_instances(
@@ -436,6 +480,7 @@ def get_cluster_info(
         zone,
         label_filters,
         lambda h: [h.RUNNING_STATE],
+        included_instances=included_instances,
     )
     instances: Dict[str, List[common.InstanceInfo]] = {}
     for res, insts in handler_to_instances.items():
@@ -444,14 +489,19 @@ def get_cluster_info(
                                   [(project_id, zone, inst) for inst in insts])
         instances.update(zip(insts, inst_info))
 
+    head_label_filters = {
+        provision_constants.TAG_RAY_NODE_KIND: 'head',
+    }
+    if not use_mig:
+        head_label_filters[
+            provision_constants.TAG_RAY_CLUSTER_NAME] = cluster_name_on_cloud
     head_instances = _filter_instances(
         handlers,
         project_id,
         zone,
-        {
-            **label_filters, provision_constants.TAG_RAY_NODE_KIND: 'head'
-        },
+        head_label_filters,
         lambda h: [h.RUNNING_STATE],
+        included_instances=included_instances,
     )
     head_instance_id = None
     for insts in head_instances.values():
@@ -486,11 +536,16 @@ def stop_instances(
     if worker_only:
         label_filters[provision_constants.TAG_RAY_NODE_KIND] = 'worker'
 
-    handlers: List[Type[instance_utils.GCPInstance]] = [
-        instance_utils.GCPComputeInstance
-    ]
+    use_mig = provider_config.get('use_managed_instance_group', False)
+    label_filters, included_instances = _get_instance_filter_scope(
+        project_id, zone, cluster_name_on_cloud, label_filters, use_mig)
+    handlers: List[Type[instance_utils.GCPInstance]]
+    if use_mig:
+        handlers = [instance_utils.GCPManagedInstanceGroup]
+    else:
+        handlers = [instance_utils.GCPComputeInstance]
     use_tpu_vms = provider_config.get('_has_tpus', False)
-    if use_tpu_vms:
+    if use_tpu_vms and not use_mig:
         handlers.append(instance_utils.GCPTPUVMInstance)
 
     handler_to_instances = _filter_instances(
@@ -499,6 +554,7 @@ def stop_instances(
         zone,
         label_filters,
         lambda handler: handler.NEED_TO_STOP_STATES,
+        included_instances=included_instances,
     )
     all_instances = [
         i for instances in handler_to_instances.values() for i in instances
@@ -549,9 +605,12 @@ def terminate_instances(
     use_mig = provider_config.get('use_managed_instance_group', False)
     if use_mig:
         # Deleting the MIG will also delete the instances.
+        delete_kwargs = {}
+        if '_is_tpu_mig' in provider_config:
+            delete_kwargs['is_tpu_mig'] = provider_config['_is_tpu_mig']
         mig_exists_and_deleted = (
             instance_utils.GCPManagedInstanceGroup.delete_mig(
-                project_id, zone, cluster_name_on_cloud))
+                project_id, zone, cluster_name_on_cloud, **delete_kwargs))
         if mig_exists_and_deleted:
             return
 
@@ -561,14 +620,24 @@ def terminate_instances(
     if worker_only:
         label_filters[provision_constants.TAG_RAY_NODE_KIND] = 'worker'
 
-    handlers: List[Type[instance_utils.GCPInstance]] = [
-        instance_utils.GCPComputeInstance
-    ]
-    if use_tpu_vms:
+    label_filters, included_instances = _get_instance_filter_scope(
+        project_id, zone, cluster_name_on_cloud, label_filters, use_mig)
+    handlers: List[Type[instance_utils.GCPInstance]]
+    if use_mig:
+        handlers = [instance_utils.GCPManagedInstanceGroup]
+    else:
+        handlers = [instance_utils.GCPComputeInstance]
+    if use_tpu_vms and not use_mig:
         handlers.append(instance_utils.GCPTPUVMInstance)
 
-    handler_to_instances = _filter_instances(handlers, project_id, zone,
-                                             label_filters, lambda _: None)
+    handler_to_instances = _filter_instances(
+        handlers,
+        project_id,
+        zone,
+        label_filters,
+        lambda _: None,
+        included_instances=included_instances,
+    )
     operations = collections.defaultdict(list)
     errs = []
     for handler, instances in handler_to_instances.items():
@@ -624,15 +693,26 @@ def open_ports(
     label_filters = {
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
-    handlers: List[Type[instance_utils.GCPInstance]] = [
-        instance_utils.GCPComputeInstance,
-    ]
+    use_mig = provider_config.get('use_managed_instance_group', False)
+    label_filters, included_instances = _get_instance_filter_scope(
+        project_id, zone, cluster_name_on_cloud, label_filters, use_mig)
+    handlers: List[Type[instance_utils.GCPInstance]]
+    if use_mig:
+        handlers = [instance_utils.GCPManagedInstanceGroup]
+    else:
+        handlers = [instance_utils.GCPComputeInstance]
     use_tpu_vms = provider_config.get('_has_tpus', False)
-    if use_tpu_vms:
+    if use_tpu_vms and not use_mig:
         handlers.append(instance_utils.GCPTPUVMInstance)
 
-    handler_to_instances = _filter_instances(handlers, project_id, zone,
-                                             label_filters, lambda _: None)
+    handler_to_instances = _filter_instances(
+        handlers,
+        project_id,
+        zone,
+        label_filters,
+        lambda _: None,
+        included_instances=included_instances,
+    )
     operations = collections.defaultdict(list)
     compute_handler: Type[instance_utils.GCPInstance] = (
         instance_utils.GCPComputeInstance)

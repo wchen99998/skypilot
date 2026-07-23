@@ -693,15 +693,35 @@ This will deploy the controller as a Kubernetes Deployment with persistent stora
 Using long-lived credentials
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Since the jobs controller is a long-lived instance that manages other cloud instances, it's best to **use static credentials that do not expire**. If a credential expires, it could leave the controller with no way to clean up a job, leading to expensive cloud instance leaks.
+The process managing jobs must retain cloud access for provisioning, recovery,
+cancellation, and cleanup. Prefer automatically renewable workload identities
+over user login sessions or static keys:
 
-To use long-lived static credentials for the jobs controller, just make sure the right credentials are in use by SkyPilot. They will be automatically uploaded to the jobs controller. **If you're already using local credentials that don't expire, no action is needed.**
+- With :ref:`consolidation mode <jobs-consolidation-mode>`, the remote API
+  server manages jobs directly, so its identity must be durable. On GKE,
+  prefer `Workload Identity Federation for GKE
+  <https://cloud.google.com/kubernetes-engine/docs/concepts/workload-identity>`_;
+  on a GCP VM, prefer an attached service account.
+- A dedicated controller hosted on GCP uses
+  ``gcp.remote_identity: SERVICE_ACCOUNT`` by default. Its attached service
+  account provides renewable metadata credentials. SkyPilot removes active
+  user credential files left by an earlier ``LOCAL_CREDENTIALS`` controller
+  during setup so those files cannot shadow metadata credentials. An existing
+  controller receives this migration when its setup next runs.
+- A dedicated controller hosted outside GCP does not have a GCP metadata
+  identity. To manage GCP jobs from it, prefer `Workload Identity Federation
+  <https://cloud.google.com/iam/docs/workload-identity-federation>`_ for the
+  controller's platform with service account impersonation. A service account
+  JSON key is a last resort; store and rotate it as a secret.
 
-To set up credentials:
+Explicitly setting ``gcp.remote_identity: LOCAL_CREDENTIALS`` uploads user
+Application Default Credentials to a dedicated controller. Do not use this for
+multi-hour waits when an organization session-duration policy may expire the
+login.
 
-- **AWS**: :ref:`Create a dedicated SkyPilot IAM user <dedicated-aws-user>` and use a static ``~/.aws/credentials`` file.
-- **GCP**: :ref:`Create a GCP service account <gcp-service-account>` with a static JSON key file.
-- **Other clouds**: Make sure you are using credentials that do not expire.
+For other clouds, use the provider's attached workload identity when
+available. If static credentials are unavoidable, use a dedicated,
+least-privilege identity and rotate it without interrupting the controller.
 
 .. _jobs-controller-custom-resources:
 

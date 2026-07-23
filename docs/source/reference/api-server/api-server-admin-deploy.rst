@@ -418,9 +418,28 @@ Following tabs describe how to configure credentials for different clouds on the
     .. tab-item:: GCP
         :sync: gcp-creds-tab
 
-        We use service accounts to authenticate with GCP. Refer to :ref:`GCP service account <gcp-service-account>` guide on how to set up a service account.
+        We use service accounts to authenticate with GCP. Refer to
+        :ref:`GCP service account <gcp-service-account>` for the permissions
+        required by SkyPilot.
 
-        Once you have the JSON key for your service account, create a Kubernetes secret to store it:
+        On GKE, prefer `Workload Identity Federation for GKE
+        <https://cloud.google.com/kubernetes-engine/docs/concepts/workload-identity>`_
+        over a service account JSON key. Bind the API server's Kubernetes
+        service account to the Google service account, annotate it through
+        ``rbac.serviceAccountAnnotations``, and leave
+        ``gcpCredentials.enabled=false`` so Application Default Credentials
+        use the projected workload identity:
+
+        .. code-block:: yaml
+
+            rbac:
+              serviceAccountAnnotations:
+                iam.gke.io/gcp-service-account: skypilot@YOUR_PROJECT_ID.iam.gserviceaccount.com
+            gcpCredentials:
+              enabled: false
+
+        If a keyless workload identity is not available, create a Kubernetes
+        secret containing the service account JSON key:
 
         .. code-block:: bash
 

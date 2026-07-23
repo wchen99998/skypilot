@@ -130,6 +130,7 @@ def bulk_provision(
     region: clouds.Region,
     zones: Optional[List[clouds.Zone]],
     cluster_name: resources_utils.ClusterName,
+    resources: resources_lib.Resources,
     num_nodes: int,
     cluster_yaml: str,
     prev_cluster_ever_up: bool,
@@ -186,7 +187,13 @@ def bulk_provision(
             # Pausing to wait on an external condition: keep the resources for
             # resume, do not tear down.
             raise
-        except Exception as exc:  # pylint: disable=broad-except
+        except (Exception, KeyboardInterrupt) as exc:  # pylint: disable=broad-except
+            if (isinstance(exc, KeyboardInterrupt) and
+                    _cluster_teardown_owns_cancellation()):
+                # sky down/stop has already signaled this request and will
+                # perform teardown after the launch worker unwinds. Avoid two
+                # concurrent cleanup owners racing cloud and local state.
+                raise
             zone_str = 'all zones'
             if zones:
                 zone_str = ','.join(zone.name for zone in zones)
@@ -194,8 +201,11 @@ def bulk_provision(
                          f'on {cloud} ({zone_str}).')
             logger.debug(f'bulk_provision for {cluster_name!r} '
                          f'failed. Stacktrace:\n{traceback.format_exc()}')
-            # If the cluster was ever up, stop it; otherwise terminate it.
-            terminate = not prev_cluster_ever_up
+            # Preserve a previously-UP cluster by stopping it, unless the
+            # resource's recovery contract requires deletion before it can be
+            # recreated (for example, a failed Compute TPU VM).
+            terminate = (not prev_cluster_ever_up or
+                         resources.need_cleanup_after_preemption_or_failure())
             terminate_str = ('Terminating' if terminate else 'Stopping')
             logger.debug(f'{terminate_str} the failed cluster.')
             retry_cnt = 1
@@ -240,6 +250,23 @@ def bulk_provision(
                         'manually terminate the cluster. '
                         f'Details: {formatted_exception}') from e
             raise
+
+
+def _cluster_teardown_owns_cancellation() -> bool:
+    """Whether the current request was cancelled by sky down/stop."""
+    request_id = common_utils.get_current_request_id()
+    if request_id == 'dummy-request-id':
+        return False
+    try:
+        # Imported lazily to keep the cloud provisioner usable without the API
+        # server request subsystem and to avoid a module import cycle.
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import requests as requests_lib
+        request = requests_lib.get_request(request_id, fields=['status_msg'])
+    except Exception:  # pylint: disable=broad-except
+        return False
+    return (request is not None and request.status_msg
+            == requests_lib.CLUSTER_TEARDOWN_CANCELLATION_STATUS)
 
 
 def teardown_cluster(cloud_name: str, cluster_name: resources_utils.ClusterName,

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from sky import exceptions
 from sky import resources
 from sky import task
 from sky.backends import cloud_vm_ray_backend
@@ -612,6 +613,70 @@ class TestCloudVmRayBackendTeardownNoLock:
         mock_run_on_head.assert_not_called()
         mock_get_yaml.assert_called_once_with(refreshed_handle.cluster_yaml)
 
+    @pytest.mark.parametrize('failure_point', ['kill', 'ack'])
+    def test_cancellation_failure_aborts_before_cloud_teardown(
+            self, failure_point):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('test-cluster',
+                                   '/tmp/stale.yaml',
+                                   has_ray=False)
+        kill_side_effect = (RuntimeError('kill failed')
+                            if failure_point == 'kill' else None)
+        ack_side_effect = (RuntimeError('ack timeout')
+                           if failure_point == 'ack' else None)
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                'kill_cluster_requests',
+                return_value=['launch-request'],
+                side_effect=kill_side_effect), patch(
+                    'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                    'wait_for_request_cancellation',
+                    side_effect=ack_side_effect) as mock_wait, patch(
+                        'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                        'refresh_cluster_status_handle') as mock_refresh:
+            with pytest.raises(RuntimeError, match='kill failed|ack timeout'):
+                backend.teardown_no_lock(handle, terminate=True)
+
+        mock_refresh.assert_not_called()
+        if failure_point == 'kill':
+            mock_wait.assert_not_called()
+
+    @pytest.mark.parametrize('failure_point', ['kill', 'ack'])
+    def test_cancellation_failure_aborts_before_force_unlock(
+            self, failure_point):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('test-cluster',
+                                   '/tmp/stale.yaml',
+                                   has_ray=False)
+        mock_lock = MagicMock()
+        kill_side_effect = (RuntimeError('kill failed')
+                            if failure_point == 'kill' else None)
+        ack_side_effect = (RuntimeError('ack timeout')
+                           if failure_point == 'ack' else None)
+
+        with patch('sky.backends.cloud_vm_ray_backend.backend_utils.'
+                   'check_owner_identity'), patch(
+                       'sky.backends.cloud_vm_ray_backend.locks.get_lock',
+                       return_value=mock_lock), patch(
+                           'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                           'kill_cluster_requests',
+                           return_value=['launch-request'],
+                           side_effect=kill_side_effect), patch(
+                               'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                               'wait_for_request_cancellation',
+                               side_effect=ack_side_effect) as mock_wait, \
+             patch.object(
+                                       backend,
+                                       'teardown_no_lock') as mock_teardown:
+            with pytest.raises(RuntimeError, match='kill failed|ack timeout'):
+                backend._teardown(handle, terminate=True)
+
+        mock_lock.force_unlock.assert_not_called()
+        mock_teardown.assert_not_called()
+        if failure_point == 'kill':
+            mock_wait.assert_not_called()
+
 
 class TestNewHandleRuntimeMetadata:
     """Runtime metadata a freshly constructed handle starts with."""
@@ -633,3 +698,37 @@ class TestNewHandleRuntimeMetadata:
         metadata = handle.provision_runtime_metadata
         assert (metadata.has_ray, metadata.has_skylet, metadata.has_job_queue,
                 metadata.ssh_available) == (False, False, False, False)
+
+
+def test_compute_tpu_mig_scale_down_rejected_before_teardown():
+    launched_resources = resources.Resources(infra='gcp/us-east5/us-east5-a',
+                                             instance_type='ct6e-standard-4t')
+    handle = CloudVmRayResourceHandle(
+        cluster_name='tpu-cluster',
+        cluster_name_on_cloud='tpu-cluster-cloud',
+        cluster_yaml='/tmp/tpu-cluster.yml',
+        launched_nodes=4,
+        launched_resources=launched_resources,
+    )
+    resize_task = task.Task(num_nodes=3, resources=launched_resources)
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+
+    with patch.object(
+            cloud_vm_ray_backend.global_user_state,
+            'get_cluster_yaml_dict',
+            return_value={'provider': {
+                'use_managed_instance_group': True,
+            }}), patch.object(
+                cloud_vm_ray_backend.provision_lib,
+                'terminate_instances') as terminate_instances, patch.object(
+                    backend, 'run_on_head') as run_on_head:
+        with pytest.raises(exceptions.NotSupportedError,
+                           match='smaller topology is validated'):
+            backend._handle_resize_pre_provision(
+                handle,
+                resize_task,
+                'tpu-cluster',
+                cluster_status=status_lib.ClusterStatus.UP)
+
+    terminate_instances.assert_not_called()
+    run_on_head.assert_not_called()

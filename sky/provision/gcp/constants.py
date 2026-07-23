@@ -375,6 +375,7 @@ VM_MINIMAL_PERMISSIONS = [
     'compute.instances.get',
     'compute.instances.list',
     'compute.instances.setLabels',
+    'compute.instances.setMetadata',
     'compute.instances.setServiceAccount',
     'compute.instances.start',
     'compute.instances.stop',
@@ -424,6 +425,31 @@ FIREWALL_PERMISSIONS = [
 
 RESERVATION_PERMISSIONS = [
     'compute.reservations.list',
+]
+
+# Additional project-level permissions used by the regional resources in a
+# Compute Engine TPU Flex-start MIG.  Keep this in sync with the API methods in
+# sky/provision/gcp/mig_utils.py and the minimal-permissions documentation.
+#
+# listManagedInstances uses compute.instanceGroupManagers.get rather than a
+# separate list permission. Deleting a MIG requires both
+# compute.instanceGroupManagers.delete and compute.instanceGroups.delete:
+# https://cloud.google.com/compute/docs/reference/rest/v1/regionInstanceGroupManagers/listManagedInstances
+# https://cloud.google.com/compute/docs/reference/rest/v1/regionInstanceGroupManagers/delete
+TPU_FLEX_START_MIG_PERMISSIONS = [
+    'compute.instanceGroupManagers.create',
+    'compute.instanceGroupManagers.delete',
+    'compute.instanceGroupManagers.get',
+    'compute.instanceGroups.delete',
+    'compute.instanceTemplates.create',
+    'compute.instanceTemplates.delete',
+    'compute.instanceTemplates.get',
+    'compute.instanceTemplates.useReadOnly',
+    'compute.regionOperations.get',
+    'compute.resourcePolicies.create',
+    'compute.resourcePolicies.delete',
+    'compute.resourcePolicies.get',
+    'compute.resourcePolicies.use',
 ]
 
 TPU_MINIMAL_PERMISSIONS = [

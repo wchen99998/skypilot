@@ -79,6 +79,20 @@ def http_error_exception():
 
 
 @common.load_lazy_modules(_LAZY_MODULES)
+def http_transport_error_exception():
+    """Base exception for retryable httplib2 transport failures."""
+    import httplib2
+    return httplib2.HttpLib2Error
+
+
+@common.load_lazy_modules(_LAZY_MODULES)
+def auth_transport_error_exception():
+    """Transport error raised while google-auth obtains credentials."""
+    from google.auth import exceptions
+    return exceptions.TransportError
+
+
+@common.load_lazy_modules(_LAZY_MODULES)
 def credential_error_exception():
     """CredentialError exception."""
     from google.auth import exceptions

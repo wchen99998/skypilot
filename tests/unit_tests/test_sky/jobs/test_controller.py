@@ -754,6 +754,7 @@ class TestTaskCleanup:
     def _make_task(self, file_mounts=None):
         task = MagicMock()
         task.name = 'test-task'
+        task.metadata = {}
         task.file_mounts = file_mounts
         task.storage_mounts = {}
         return task
@@ -783,6 +784,22 @@ class TestTaskCleanup:
 
         assert not mount_0.exists(), 'mount_0 should be cleaned up'
         assert not mount_1.exists(), 'mount_1 should be cleaned up'
+
+    @pytest.mark.asyncio
+    async def test_cleanup_target_lookup_failure_still_terminates_cluster(
+            self, cleanup_patches):
+        task = self._make_task()
+        dag = MagicMock()
+        dag.tasks = [task]
+
+        manager = ControllerManager('test-uuid')
+        with patch('sky.jobs.controller._get_dag', return_value=dag), patch(
+                'sky.jobs.controller._get_gcp_tpu_mig_cleanup_target',
+                side_effect=OSError('persisted YAML is unreadable')):
+            await manager._cleanup(job_id=1)
+
+        cleanup_patches['terminate'].assert_called_once_with(
+            'test-cluster', graceful=False, graceful_timeout=None)
 
 
 class TestDownloadLogsForCancelledJob:

@@ -5,6 +5,7 @@ import functools
 import os
 import pathlib
 import queue as queue_lib
+import threading
 import time
 from typing import List
 from unittest import mock
@@ -472,6 +473,86 @@ def mock_fd_operations(isolated_database, monkeypatch):
 
 def _success_entrypoint():
     return 'success'
+
+
+_STATUS_MSG_AT_ENTRYPOINT = []
+_MARKER_RACE_STARTED = threading.Event()
+_MARKER_RACE_RELEASE = threading.Event()
+
+
+def _blocking_capture_status_msg_entrypoint():
+    request = requests_lib.get_request('teardown-marker-race',
+                                       fields=['status_msg'])
+    _STATUS_MSG_AT_ENTRYPOINT.append(request.status_msg if request else None)
+    _MARKER_RACE_STARTED.set()
+    assert _MARKER_RACE_RELEASE.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_teardown_marker_survives_worker_start_and_cancel_retry(
+        mock_fd_operations):
+    """Exercise marker -> worker start -> cancel -> down retry interleaving."""
+    _STATUS_MSG_AT_ENTRYPOINT.clear()
+    _MARKER_RACE_STARTED.clear()
+    _MARKER_RACE_RELEASE.clear()
+    req = requests_lib.Request(
+        request_id='teardown-marker-race',
+        name='sky.launch',
+        entrypoint=_blocking_capture_status_msg_entrypoint,
+        request_body=payloads.RequestBody(),
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=0.0,
+        user_id='test-user',
+        cluster_name='test-cluster')
+    await requests_lib.create_if_not_exists_async(req)
+
+    storage = requests_lib.request_storage.get_request_backend()
+    worker_thread = None
+
+    def _kill_after_worker_starts(request_ids=None, user_id=None):
+        nonlocal worker_thread
+        del user_id
+        if request_ids:
+            # kill_cluster_requests has written the ownership marker, but has
+            # not cancelled yet. Start the executor in that exact window.
+            worker_thread = threading.Thread(
+                target=executor._request_execution_wrapper,
+                args=('teardown-marker-race', False))
+            worker_thread.start()
+            assert _MARKER_RACE_STARTED.wait(timeout=5)
+        return storage.kill_requests(request_ids=request_ids)
+
+    try:
+        with mock.patch.object(requests_lib,
+                               '_kill_requests',
+                               side_effect=_kill_after_worker_starts), \
+             mock.patch.object(requests_lib.os, 'kill'):
+            request_ids = requests_lib.kill_cluster_requests(
+                'test-cluster', 'sky.down')
+            assert request_ids == ['teardown-marker-race']
+
+            cancelled = requests_lib.get_request('teardown-marker-race')
+            assert cancelled is not None
+            assert cancelled.status == requests_lib.RequestStatus.CANCELLED
+            assert cancelled.pid is not None
+            assert (cancelled.status_msg ==
+                    requests_lib.CLUSTER_TEARDOWN_CANCELLATION_STATUS)
+
+            # A later down attempt must rediscover the pending acknowledgement.
+            assert requests_lib.kill_cluster_requests(
+                'test-cluster', 'sky.down') == ['teardown-marker-race']
+    finally:
+        _MARKER_RACE_RELEASE.set()
+        if worker_thread is not None:
+            worker_thread.join(timeout=5)
+
+    assert _STATUS_MSG_AT_ENTRYPOINT == [
+        requests_lib.CLUSTER_TEARDOWN_CANCELLATION_STATUS
+    ]
+    assert worker_thread is not None and not worker_thread.is_alive()
+    acknowledged = requests_lib.get_request('teardown-marker-race')
+    assert acknowledged is not None
+    assert acknowledged.pid is None
 
 
 def _retryable_error_entrypoint():
@@ -1107,6 +1188,9 @@ async def test_wrapper_clears_in_request_execution_after_success(
                                         ignore_return_value=False)
 
     assert executor._in_request_execution is False
+    updated = requests_lib.get_request('gate-cleared-on-success')
+    assert updated is not None
+    assert updated.pid is None
 
 
 def _gate_clears_after_success_entrypoint():

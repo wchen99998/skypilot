@@ -122,25 +122,66 @@ def _get_dag(job_id: int) -> 'sky.Dag':
     return dag
 
 
-def _cleanup_gcp_tpu_mig_if_needed(task: 'sky.Task', cluster_name: str) -> None:
+_GCPTpuMigCleanupTarget = Tuple[str, str, str]
+
+
+def _get_gcp_tpu_mig_cleanup_target(
+        task: 'sky.Task',
+        cluster_name: str) -> Optional[_GCPTpuMigCleanupTarget]:
+    """Returns the persisted project, region, and cloud cluster name."""
+    handle = global_user_state.get_handle_from_cluster_name(cluster_name)
+    if handle is not None:
+        launched_resources = getattr(handle, 'launched_resources', None)
+        if launched_resources is None:
+            return None
+        cloud = launched_resources.cloud
+        instance_type = launched_resources.instance_type
+        if (cloud is None or not cloud.is_same_cloud(sky.GCP()) or
+                instance_type is None or
+                not gcp_mig_utils.is_compute_tpu_machine_type(instance_type)):
+            return None
+
+        try:
+            cluster_yaml = global_user_state.get_cluster_yaml_dict(
+                getattr(handle, 'cluster_yaml', None))
+        except (ValueError, TypeError) as e:
+            logger.warning('Cannot safely determine the persisted GCP '
+                           'provider config for TPU MIG cleanup of '
+                           f'{cluster_name!r}: {e}')
+            return None
+        provider_config = cluster_yaml.get('provider', {})
+        if not provider_config.get('use_managed_instance_group', False):
+            return None
+        project_id = provider_config.get('project_id')
+        region = provider_config.get('region') or launched_resources.region
+        cluster_name_on_cloud = getattr(handle, 'cluster_name_on_cloud', None)
+        if not project_id or not region or not cluster_name_on_cloud:
+            logger.warning('Cannot safely clean up GCP TPU MIG resources for '
+                           f'{cluster_name!r}: its persisted project, region, '
+                           'or cloud cluster name is missing.')
+            return None
+        return project_id, region, cluster_name_on_cloud
+
+    # Legacy fallback for a launch that failed before its handle/provider
+    # config was persisted.
     resources = task.best_resources
     if resources is None:
         if len(task.resources) != 1:
-            return
+            return None
         resources = next(iter(task.resources))
 
     cloud = resources.cloud
     if cloud is None or not cloud.is_same_cloud(sky.GCP()):
-        return
+        return None
 
     if resources.instance_type is None:
-        return
+        return None
     if not gcp_mig_utils.is_compute_tpu_machine_type(resources.instance_type):
-        return
+        return None
 
     region = resources.region
     if region is None:
-        return
+        return None
 
     managed_instance_group_config = (
         skypilot_config.get_effective_region_config(
@@ -150,11 +191,23 @@ def _cleanup_gcp_tpu_mig_if_needed(task: 'sky.Task', cluster_name: str) -> None:
             default_value=None,
             override_configs=resources.cluster_config_overrides))
     if managed_instance_group_config is None:
-        return
+        return None
 
     cluster_name_on_cloud = common_utils.make_cluster_name_on_cloud(
         cluster_name, max_length=cloud.max_cluster_name_length())
     project_id = sky.GCP.get_project_id()
+    return project_id, region, cluster_name_on_cloud
+
+
+def _cleanup_gcp_tpu_mig_if_needed(
+        task: 'sky.Task',
+        cluster_name: str,
+        cleanup_target: Optional[_GCPTpuMigCleanupTarget] = None) -> None:
+    if cleanup_target is None:
+        cleanup_target = _get_gcp_tpu_mig_cleanup_target(task, cluster_name)
+    if cleanup_target is None:
+        return
+    project_id, region, cluster_name_on_cloud = cleanup_target
     logger.info('Ensuring GCP TPU DWS MIG resources are cleaned up for '
                 f'{cluster_name_on_cloud!r}.')
     gcp_instance_utils.GCPManagedInstanceGroup.delete_tpu_mig_resources(
@@ -2628,6 +2681,15 @@ class ControllerManager:
                     cluster_name = (
                         managed_job_utils.generate_managed_job_cluster_name(
                             task.name, job_id))
+                    gcp_tpu_mig_cleanup_target = None
+                    try:
+                        gcp_tpu_mig_cleanup_target = (
+                            _get_gcp_tpu_mig_cleanup_target(task, cluster_name))
+                    except Exception as lookup_error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Cannot determine the optional TPU MIG cleanup '
+                            'target for %r; continuing with ordinary cluster '
+                            'termination: %s', cluster_name, lookup_error)
                     try:
                         managed_job_utils.terminate_cluster(
                             cluster_name,
@@ -2635,13 +2697,13 @@ class ControllerManager:
                             graceful_timeout=graceful_timeout)
                     except Exception:
                         try:
-                            _cleanup_gcp_tpu_mig_if_needed(task, cluster_name)
+                            _cleanup_gcp_tpu_mig_if_needed(
+                                task, cluster_name, gcp_tpu_mig_cleanup_target)
                         except Exception as cleanup_error:  # pylint: disable=broad-except
                             logger.warning(
                                 'TPU MIG cleanup also failed after cluster '
                                 'termination failed: %s', cleanup_error)
                         raise
-                    _cleanup_gcp_tpu_mig_if_needed(task, cluster_name)
                     status = core.status(cluster_names=[cluster_name],
                                          all_users=True)
                     assert (len(status) == 0 or

@@ -1,5 +1,7 @@
 import os
 import pathlib
+import subprocess
+import typing
 from unittest import mock
 
 import pytest
@@ -14,8 +16,227 @@ from sky.exceptions import ClusterNotUpError
 from sky.resources import Resources
 from sky.utils import common
 from sky.utils import common_utils
+from sky.utils import schemas
 from sky.utils import status_lib
 from sky.utils import yaml_utils
+
+_GCP_CREDENTIAL_ENV_VARS = (
+    'CLOUDSDK_CONFIG',
+    'CLOUDSDK_CORE_ACCOUNT',
+    'CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT',
+    'CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE',
+    'CLOUDSDK_AUTH_ACCESS_TOKEN',
+    'CLOUDSDK_AUTH_ACCESS_TOKEN_FILE',
+    'CLOUDSDK_AUTH_LOGIN_CONFIG_FILE',
+    'GOOGLE_APPLICATION_CREDENTIALS',
+)
+
+
+@pytest.mark.parametrize(('cloud', 'remote_identity', 'should_cleanup'), [
+    (clouds.GCP(), schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value, True),
+    (clouds.GCP(), schemas.RemoteIdentityOptions.LOCAL_CREDENTIALS.value,
+     False),
+    (clouds.AWS(), schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value, False),
+])
+def test_gcp_service_account_credential_cleanup_is_scoped(
+        cloud, remote_identity, should_cleanup):
+    initial_setup_commands = ['existing-command']
+    resources_vars: typing.Dict[str, typing.Any] = {
+        'initial_setup_commands': initial_setup_commands
+    }
+
+    backend_utils._maybe_add_gcp_service_account_credential_cleanup(
+        cloud, remote_identity, resources_vars)
+
+    if should_cleanup:
+        assert initial_setup_commands == ['existing-command']
+        cleanup_command = resources_vars[
+            'gcp_service_account_credential_cleanup_command']
+        assert cleanup_command == (
+            backend_utils._GCP_SERVICE_ACCOUNT_CREDENTIAL_CLEANUP_COMMAND)
+        assert 'application_default_credentials.json' in cleanup_command
+        assert 'credentials.db' in cleanup_command
+        assert 'credentials.db*' not in cleanup_command
+        assert 'gcloud config unset account' in cleanup_command
+        assert 'gcloud config unset auth/impersonate_service_account' in (
+            cleanup_command)
+        assert 'gcloud config unset auth/credential_file_override' in (
+            cleanup_command)
+        assert 'gcloud config unset auth/access_token_file' in cleanup_command
+        assert 'gcloud config unset auth/login_config_file' in cleanup_command
+        assert 'gcloud auth print-access-token' in cleanup_command
+        assert '|| true' not in cleanup_command
+        assert cleanup_command.startswith('set -e;')
+    else:
+        assert initial_setup_commands == ['existing-command']
+        assert resources_vars[
+            'gcp_service_account_credential_cleanup_command'] is None
+
+
+def test_gcp_service_account_credential_cleanup_command(tmp_path):
+    home = tmp_path / 'home'
+    gcloud_dir = home / '.config' / 'gcloud'
+    gcloud_dir.mkdir(parents=True)
+    removed_files = [
+        'application_default_credentials.json',
+        'credentials.db',
+        'credentials.db-wal',
+        'access_tokens.db',
+        'access_tokens.db-shm',
+    ]
+    for filename in removed_files:
+        (gcloud_dir / filename).write_text('secret', encoding='utf-8')
+    legacy_dir = gcloud_dir / 'legacy_credentials'
+    legacy_dir.mkdir()
+    (legacy_dir / 'token').write_text('secret', encoding='utf-8')
+    preserved_backup = gcloud_dir / 'credentials.db.backup'
+    preserved_backup.write_text('preserve', encoding='utf-8')
+
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake_gcloud = bin_dir / 'gcloud'
+    fake_gcloud.write_text(
+        '#!/bin/sh\n'
+        'printf "%s\\n" "$*" >> "$HOME/gcloud-commands"\n'
+        'case "$*" in\n'
+        '  "config unset account --quiet") ;;\n'
+        '  "config unset auth/impersonate_service_account --quiet") ;;\n'
+        '  "config unset auth/credential_file_override --quiet") ;;\n'
+        '  "config unset auth/access_token_file --quiet") ;;\n'
+        '  "config unset auth/login_config_file --quiet") ;;\n'
+        '  "config configurations list --filter=is_active:true '
+        '--format=value(name) --quiet") printf "default\\n" ;;\n'
+        '  "config configurations describe default '
+        '--format=value(properties.core.account) --quiet") ;;\n'
+        '  "config configurations describe default '
+        '--format=value(properties.auth.impersonate_service_account) '
+        '--quiet") ;;\n'
+        '  "config configurations describe default '
+        '--format=value(properties.auth.credential_file_override) --quiet") '
+        ';;\n'
+        '  "config configurations describe default '
+        '--format=value(properties.auth.access_token_file) --quiet") ;;\n'
+        '  "config configurations describe default '
+        '--format=value(properties.auth.login_config_file) --quiet") ;;\n'
+        '  "auth list --filter=status:ACTIVE --format=value(account)") '
+        'printf "metadata-sa@example.com\\n" ;;\n'
+        '  "auth print-access-token --quiet") printf "metadata-token\\n" ;;\n'
+        '  *) exit 64 ;;\n'
+        'esac\n',
+        encoding='utf-8')
+    fake_gcloud.chmod(0o755)
+    fake_python = bin_dir / 'python3'
+    fake_python.write_text(
+        '#!/bin/sh\n'
+        'printf "metadata-check\\n" > "$HOME/metadata-check"\n'
+        'printf "metadata-sa@example.com\\n"\n',
+        encoding='utf-8')
+    fake_python.chmod(0o755)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _GCP_CREDENTIAL_ENV_VARS
+    }
+    env.update({
+        'HOME': str(home),
+        'PATH': f'{bin_dir}:/usr/bin:/bin',
+    })
+
+    subprocess.run([
+        'bash', '-c',
+        backend_utils._GCP_SERVICE_ACCOUNT_CREDENTIAL_CLEANUP_COMMAND
+    ],
+                   check=True,
+                   env=env)
+
+    assert all(
+        not (gcloud_dir / filename).exists() for filename in removed_files)
+    assert not legacy_dir.exists()
+    assert (home /
+            'metadata-check').read_text(encoding='utf-8') == 'metadata-check\n'
+    assert preserved_backup.read_text(encoding='utf-8') == 'preserve'
+    assert (home /
+            'gcloud-commands').read_text(encoding='utf-8').splitlines() == [
+                'config unset account --quiet',
+                'config unset auth/impersonate_service_account --quiet',
+                'config unset auth/credential_file_override --quiet',
+                'config unset auth/access_token_file --quiet',
+                'config unset auth/login_config_file --quiet',
+                ('config configurations list --filter=is_active:true '
+                 '--format=value(name) --quiet'),
+                ('config configurations describe default '
+                 '--format=value(properties.core.account) --quiet'),
+                ('config configurations describe default '
+                 '--format=value(properties.auth.'
+                 'impersonate_service_account) --quiet'),
+                ('config configurations describe default '
+                 '--format=value(properties.auth.'
+                 'credential_file_override) --quiet'),
+                ('config configurations describe default '
+                 '--format=value(properties.auth.access_token_file) --quiet'),
+                ('config configurations describe default '
+                 '--format=value(properties.auth.login_config_file) --quiet'),
+                'auth list --filter=status:ACTIVE --format=value(account)',
+                'auth print-access-token --quiet',
+            ]
+
+
+def test_gcp_service_account_cleanup_verifies_metadata_without_gcloud(tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir()
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake_python = bin_dir / 'python3'
+    fake_python.write_text(
+        '#!/bin/sh\n'
+        'printf "metadata-check\\n" > "$HOME/metadata-check"\n'
+        'printf "metadata-sa@example.com\\n"\n',
+        encoding='utf-8')
+    fake_python.chmod(0o755)
+    fake_rm = bin_dir / 'rm'
+    fake_rm.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+    fake_rm.chmod(0o755)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _GCP_CREDENTIAL_ENV_VARS
+    }
+    env.update({
+        'HOME': str(home),
+        'PATH': str(bin_dir),
+    })
+
+    subprocess.run([
+        '/bin/bash', '-c',
+        backend_utils._GCP_SERVICE_ACCOUNT_CREDENTIAL_CLEANUP_COMMAND
+    ],
+                   check=True,
+                   env=env)
+
+    assert (home /
+            'metadata-check').read_text(encoding='utf-8') == 'metadata-check\n'
+
+
+@pytest.mark.parametrize('credential_env_var', _GCP_CREDENTIAL_ENV_VARS)
+def test_gcp_service_account_credential_cleanup_rejects_environment_override(
+        tmp_path, credential_env_var):
+    home = tmp_path / 'home'
+    home.mkdir()
+    env = {
+        'HOME': str(home),
+        'PATH': '/usr/bin:/bin',
+        credential_env_var: 'stale-credential-override',
+    }
+
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run([
+            'bash', '-c',
+            backend_utils._GCP_SERVICE_ACCOUNT_CREDENTIAL_CLEANUP_COMMAND
+        ],
+                       check=True,
+                       env=env,
+                       capture_output=True,
+                       text=True)
 
 
 # Set env var to test config file.

@@ -264,6 +264,81 @@ _FILE_MOUNT_BASENAMES_SKIP_HASH = frozenset({
     'access_tokens.db-shm',
 })
 
+# A GCP cluster that was previously launched with LOCAL_CREDENTIALS may retain
+# these files after it is relaunched with SERVICE_ACCOUNT: rsync updates
+# mounts, but does not remove remote files that are no longer mounted. ADC
+# prefers the well-known user credential file over Compute Engine metadata, so
+# leaving it behind would make the cluster keep using an expirable user
+# session instead of its attached service account.
+_GCP_SERVICE_ACCOUNT_CREDENTIAL_CLEANUP_COMMAND = (
+    'set -e; '
+    'rm -f ~/.config/gcloud/application_default_credentials.json '
+    '~/.config/gcloud/credentials.db '
+    '~/.config/gcloud/credentials.db-journal '
+    '~/.config/gcloud/credentials.db-shm '
+    '~/.config/gcloud/credentials.db-wal '
+    '~/.config/gcloud/access_tokens.db '
+    '~/.config/gcloud/access_tokens.db-journal '
+    '~/.config/gcloud/access_tokens.db-shm '
+    '~/.config/gcloud/access_tokens.db-wal; '
+    'rm -rf ~/.config/gcloud/legacy_credentials; '
+    'test -z "${CLOUDSDK_CONFIG:-}"; '
+    'test -z "${CLOUDSDK_CORE_ACCOUNT:-}"; '
+    'test -z "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}"; '
+    'test -z "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}"; '
+    'test -z "${CLOUDSDK_AUTH_ACCESS_TOKEN:-}"; '
+    'test -z "${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-}"; '
+    'test -z "${CLOUDSDK_AUTH_LOGIN_CONFIG_FILE:-}"; '
+    'test -z "${GOOGLE_APPLICATION_CREDENTIALS:-}"; '
+    # Verify metadata directly. Custom images can omit gcloud, and the
+    # link-local endpoints prove that the attached service account exists and
+    # can mint a token independently of any CLI credential store.
+    'sky_gcp_metadata_email="$('
+    "python3 -c 'import json, urllib.request; "
+    'base="http://169.254.169.254/computeMetadata/v1/instance/'
+    'service-accounts/default"; '
+    'opener=urllib.request.build_opener(urllib.request.ProxyHandler({})); '
+    'fetch=lambda path: opener.open(urllib.request.Request(base+path, '
+    'headers={"Metadata-Flavor":"Google"}), timeout=10).read(); '
+    'email=fetch("/email").decode().strip(); '
+    'token=json.loads(fetch("/token")); '
+    'assert email and token.get("access_token"); '
+    "print(email)')\"; "
+    'test -n "$sky_gcp_metadata_email"; '
+    'if command -v gcloud >/dev/null 2>&1; then '
+    'gcloud config unset account --quiet >/dev/null 2>&1; '
+    'gcloud config unset auth/impersonate_service_account --quiet '
+    '>/dev/null 2>&1; '
+    'gcloud config unset auth/credential_file_override --quiet '
+    '>/dev/null 2>&1; '
+    'gcloud config unset auth/access_token_file --quiet >/dev/null 2>&1; '
+    'gcloud config unset auth/login_config_file --quiet >/dev/null 2>&1; '
+    'sky_gcp_active_config="$(gcloud config configurations list '
+    '--filter=is_active:true --format="value(name)" --quiet)"; '
+    'test -n "$sky_gcp_active_config"; '
+    'test -z "$(gcloud config configurations describe '
+    '"$sky_gcp_active_config" '
+    '--format="value(properties.core.account)" --quiet)"; '
+    'test -z "$(gcloud config configurations describe '
+    '"$sky_gcp_active_config" '
+    '--format="value(properties.auth.impersonate_service_account)" '
+    '--quiet)"; '
+    'test -z "$(gcloud config configurations describe '
+    '"$sky_gcp_active_config" '
+    '--format="value(properties.auth.credential_file_override)" --quiet)"; '
+    'test -z "$(gcloud config configurations describe '
+    '"$sky_gcp_active_config" '
+    '--format="value(properties.auth.access_token_file)" --quiet)"; '
+    'test -z "$(gcloud config configurations describe '
+    '"$sky_gcp_active_config" '
+    '--format="value(properties.auth.login_config_file)" --quiet)"; '
+    # With local credentials and explicit account selectors removed, gcloud
+    # must resolve the same metadata account and mint a token through it.
+    'test "$(gcloud auth list --filter=status:ACTIVE '
+    '--format="value(account)")" = "$sky_gcp_metadata_email"; '
+    'gcloud auth print-access-token --quiet >/dev/null; fi; '
+    'test ! -e ~/.config/gcloud/application_default_credentials.json')
+
 _ACK_MESSAGE = 'ack'
 _FORWARDING_FROM_MESSAGE = 'Forwarding from'
 
@@ -712,6 +787,19 @@ def _get_volume_name(path: str, cluster_name_on_cloud: str) -> str:
     return f'{cluster_name_on_cloud}-{path_hash}'
 
 
+def _maybe_add_gcp_service_account_credential_cleanup(
+        cloud: clouds.Cloud, remote_identity: str,
+        resources_vars: Dict[str, Any]) -> None:
+    """Remove stale user credentials from GCP service-account clusters."""
+    resources_vars['gcp_service_account_credential_cleanup_command'] = None
+    if (not isinstance(cloud, clouds.GCP) or remote_identity !=
+            schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value):
+        return
+
+    resources_vars['gcp_service_account_credential_cleanup_command'] = (
+        _GCP_SERVICE_ACCOUNT_CREDENTIAL_CLEANUP_COMMAND)
+
+
 # TODO: too many things happening here - leaky abstraction. Refactor.
 @timeline.event
 def write_cluster_config(
@@ -996,6 +1084,8 @@ def write_cluster_config(
         cluster_name, expect_exact_match=False)
     if controller is not None:
         is_remote_controller = True
+    _maybe_add_gcp_service_account_credential_cleanup(cloud, remote_identity,
+                                                      resources_vars)
 
     # Here, if users specify the controller to be high availability, we will
     # provision a high availability controller. Whether the cloud supports

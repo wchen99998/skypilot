@@ -130,6 +130,173 @@ def test_set_request_succeeded_nonexistent_request(isolated_database):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(('test_async', 'outcome'), [
+    (False, 'failed'),
+    (True, 'failed'),
+    (False, 'succeeded'),
+    (True, 'succeeded'),
+])
+async def test_cancelled_request_is_not_overwritten(isolated_database,
+                                                    test_async, outcome):
+    request = requests.Request(request_id='cancelled-request',
+                               name='test-request',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.CANCELLED,
+                               created_at=0.0,
+                               finished_at=1.0,
+                               user_id='test-user')
+    await requests.create_if_not_exists_async(request)
+
+    if outcome == 'failed':
+        if test_async:
+            await requests.set_request_failed_async('cancelled-request',
+                                                    ValueError('cleanup'))
+        else:
+            requests.set_request_failed('cancelled-request',
+                                        ValueError('cleanup'))
+    elif test_async:
+        await requests.set_request_succeeded_async('cancelled-request', {})
+    else:
+        requests.set_request_succeeded('cancelled-request', {})
+
+    updated = await requests.get_request_async('cancelled-request')
+    assert updated is not None
+    assert updated.status == RequestStatus.CANCELLED
+    if outcome == 'failed':
+        assert 'cleanup failed' in updated.status_msg
+        assert updated.get_error()['message'] == 'cleanup'
+    else:
+        assert updated.get_return_value() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('test_async', [False, True])
+async def test_cancelled_request_failure_preserves_teardown_owner(
+        isolated_database, test_async):
+    request = requests.Request(
+        request_id='cancelled-request',
+        name='sky.launch',
+        entrypoint=dummy,
+        request_body=payloads.RequestBody(),
+        status=RequestStatus.CANCELLED,
+        status_msg=requests.CLUSTER_TEARDOWN_CANCELLATION_STATUS,
+        created_at=0.0,
+        finished_at=1.0,
+        user_id='test-user',
+        pid=12345,
+        cluster_name='test-cluster')
+    await requests.create_if_not_exists_async(request)
+
+    if test_async:
+        await requests.set_request_failed_async('cancelled-request',
+                                                ValueError('cleanup'))
+    else:
+        requests.set_request_failed('cancelled-request', ValueError('cleanup'))
+
+    updated = await requests.get_request_async('cancelled-request')
+    assert updated is not None
+    assert updated.status == RequestStatus.CANCELLED
+    assert (updated.status_msg == requests.CLUSTER_TEARDOWN_CANCELLATION_STATUS)
+    assert updated.pid == 12345
+    assert requests.kill_cluster_requests('test-cluster',
+                                          'sky.down') == ['cancelled-request']
+
+
+@pytest.mark.asyncio
+async def test_kill_cluster_requests_returns_pending_ack_on_retry(
+        isolated_database):
+    request = requests.Request(request_id='cluster-request',
+                               name='sky.launch',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.RUNNING,
+                               created_at=0.0,
+                               user_id='test-user',
+                               pid=12345,
+                               cluster_name='test-cluster')
+    await requests.create_if_not_exists_async(request)
+
+    with mock.patch.object(requests.os, 'kill') as mock_kill:
+        request_ids = requests.kill_cluster_requests('test-cluster', 'sky.down')
+        assert request_ids == ['cluster-request']
+        mock_kill.assert_called_once_with(12345, requests.signal.SIGTERM)
+
+        # A retry must still wait for the executor acknowledgement even though
+        # the first attempt already changed the request to CANCELLED.
+        request_ids = requests.kill_cluster_requests('test-cluster', 'sky.down')
+        assert request_ids == ['cluster-request']
+        mock_kill.assert_called_once()
+
+    cancelled = requests.get_request('cluster-request')
+    assert cancelled is not None
+    assert cancelled.status == RequestStatus.CANCELLED
+    assert (
+        cancelled.status_msg == requests.CLUSTER_TEARDOWN_CANCELLATION_STATUS)
+
+    with requests.update_request('cluster-request') as request_record:
+        assert request_record is not None
+        request_record.pid = None
+    assert requests.kill_cluster_requests('test-cluster', 'sky.down') == []
+
+
+@pytest.mark.asyncio
+async def test_down_waits_for_generic_cancelled_request_ack(isolated_database):
+    request = requests.Request(request_id='api-cancelled-request',
+                               name='sky.launch',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.CANCELLED,
+                               status_msg='Cancelled by sky api cancel.',
+                               created_at=0.0,
+                               user_id='test-user',
+                               pid=12345,
+                               cluster_name='test-cluster')
+    await requests.create_if_not_exists_async(request)
+
+    request_ids = requests.kill_cluster_requests('test-cluster', 'sky.down')
+
+    assert request_ids == ['api-cancelled-request']
+    updated = requests.get_request('api-cancelled-request')
+    assert updated is not None
+    assert updated.status_msg == 'Cancelled by sky api cancel.'
+
+
+@pytest.mark.asyncio
+async def test_wait_for_request_cancellation_ack(isolated_database):
+    request = requests.Request(request_id='cancelled-request',
+                               name='sky.launch',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.CANCELLED,
+                               created_at=0.0,
+                               user_id='test-user',
+                               pid=None,
+                               cluster_name='test-cluster')
+    await requests.create_if_not_exists_async(request)
+
+    requests.wait_for_request_cancellation(['cancelled-request'], timeout=0)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_request_cancellation_timeout_fails_safe(
+        isolated_database):
+    request = requests.Request(request_id='cancelled-request',
+                               name='sky.launch',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.CANCELLED,
+                               created_at=0.0,
+                               user_id='test-user',
+                               pid=12345,
+                               cluster_name='test-cluster')
+    await requests.create_if_not_exists_async(request)
+
+    with pytest.raises(RuntimeError, match='Refusing to continue cluster'):
+        requests.wait_for_request_cancellation(['cancelled-request'], timeout=0)
+
+
+@pytest.mark.asyncio
 async def test_clean_finished_requests_with_retention(isolated_database):
     """Test cleaning up old finished requests."""
     current_time = time.time()

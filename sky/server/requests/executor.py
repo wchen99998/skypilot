@@ -736,7 +736,13 @@ def _request_execution_wrapper(request_id: str,
             request_task.pid = pid
             request_task.status = api_requests.RequestStatus.RUNNING
             # Clear any leftover retry-backoff message now that we are running.
-            request_task.status_msg = None
+            # Preserve the teardown ownership marker: sky down/stop writes it
+            # before signaling cancellation, and this worker can race into
+            # RUNNING between those two transactions. A retry must still find
+            # a CANCELLED request whose acknowledgement is pending.
+            if (request_task.status_msg !=
+                    api_requests.CLUSTER_TEARDOWN_CANCELLATION_STATUS):
+                request_task.status_msg = None
             func = request_task.entrypoint
             request_body = request_task.request_body
             request_name = request_task.name
@@ -814,6 +820,21 @@ def _request_execution_wrapper(request_id: str,
     finally:
         _in_request_execution = False
         _restore_output()
+        try:
+            # The process-pool worker is reused after this wrapper returns, so
+            # its process exiting cannot acknowledge cancellation. Clearing
+            # the persisted PID here tells sky down/stop that the request has
+            # finished all request/cloud work and teardown can safely proceed.
+            # Do not clear a PID written by a later execution of this request.
+            with api_requests.update_request(request_id) as request_task:
+                if request_task is not None and request_task.pid == pid:
+                    request_task.pid = None
+        except Exception as e:  # pylint: disable=broad-except
+            # Keep the PID populated on failure. Cluster teardown will then
+            # time out and fail safe instead of racing this worker.
+            logger.error(
+                f'Failed to acknowledge completion of request {request_id}: '
+                f'{common_utils.format_exception(e)}')
         try:
             # Capture the peak RSS before GC.
             peak_rss = max(proc.memory_info().rss, metrics_lib.peak_rss_bytes)

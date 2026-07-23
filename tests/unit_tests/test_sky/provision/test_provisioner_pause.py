@@ -3,7 +3,7 @@
 A paused execution (ExecutionPausedError) is waiting on an external condition
 and wants its partially provisioned resources kept so it can resume. This pins
 that bulk_provision re-raises the pause without tearing down, while still
-tearing down on an ordinary provisioning failure.
+tearing down on failures and cancellation.
 """
 import contextlib
 from unittest import mock
@@ -13,6 +13,7 @@ import pytest
 from sky import clouds
 from sky import exceptions
 from sky import global_user_state
+from sky import resources as resources_lib
 from sky.provision import provisioner
 from sky.utils import resources_utils
 
@@ -46,15 +47,22 @@ def patched_bulk_provision(monkeypatch):
     return teardown_mock
 
 
-def _call_bulk_provision(tmp_path):
-    return provisioner.bulk_provision(cloud=clouds.Kubernetes(),
+def _call_bulk_provision(tmp_path, resources=None, prev_cluster_ever_up=False):
+    cloud = clouds.Kubernetes()
+    if resources is None:
+        resources = resources_lib.Resources(cloud=cloud, instance_type='dummy')
+    else:
+        assert resources.cloud is not None
+        cloud = resources.cloud
+    return provisioner.bulk_provision(cloud=cloud,
                                       region=clouds.Region('us'),
                                       zones=None,
                                       cluster_name=resources_utils.ClusterName(
                                           'c', 'c-on-cloud'),
+                                      resources=resources,
                                       num_nodes=1,
                                       cluster_yaml='/fake/cluster.yaml',
-                                      prev_cluster_ever_up=False,
+                                      prev_cluster_ever_up=prev_cluster_ever_up,
                                       log_dir=str(tmp_path))
 
 
@@ -88,3 +96,73 @@ def test_bulk_provision_tears_down_on_ordinary_failure(patched_bulk_provision,
         _call_bulk_provision(tmp_path)
 
     patched_bulk_provision.assert_called_once()
+
+
+def test_bulk_provision_terminates_previously_up_compute_tpu_after_failure(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    """A failed Compute TPU must be deleted before it can be recreated."""
+    monkeypatch.setattr(
+        provisioner, '_bulk_provision',
+        mock.MagicMock(side_effect=RuntimeError('provisioning failed')))
+    resources = resources_lib.Resources(cloud=clouds.GCP(),
+                                        instance_type='ct6e-standard-4t')
+
+    with pytest.raises(RuntimeError, match='provisioning failed'):
+        _call_bulk_provision(tmp_path,
+                             resources=resources,
+                             prev_cluster_ever_up=True)
+
+    patched_bulk_provision.assert_called_once_with('GCP',
+                                                   resources_utils.ClusterName(
+                                                       'c', 'c-on-cloud'),
+                                                   terminate=True,
+                                                   provider_config={})
+
+
+def test_bulk_provision_stops_other_previously_up_resources_after_failure(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    """Previously-UP resources keep the normal state-preserving stop path."""
+    monkeypatch.setattr(
+        provisioner, '_bulk_provision',
+        mock.MagicMock(side_effect=RuntimeError('provisioning failed')))
+    resources = resources_lib.Resources(cloud=clouds.Kubernetes(),
+                                        instance_type='dummy')
+
+    with pytest.raises(RuntimeError, match='provisioning failed'):
+        _call_bulk_provision(tmp_path,
+                             resources=resources,
+                             prev_cluster_ever_up=True)
+
+    patched_bulk_provision.assert_called_once_with('Kubernetes',
+                                                   resources_utils.ClusterName(
+                                                       'c', 'c-on-cloud'),
+                                                   terminate=False,
+                                                   provider_config={})
+
+
+def test_bulk_provision_tears_down_on_keyboard_interrupt(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    """API-request cancellation must roll back accepted cloud resources."""
+    monkeypatch.setattr(
+        provisioner, '_bulk_provision',
+        mock.MagicMock(side_effect=KeyboardInterrupt('request cancelled')))
+
+    with pytest.raises(KeyboardInterrupt, match='request cancelled'):
+        _call_bulk_provision(tmp_path)
+
+    patched_bulk_provision.assert_called_once()
+
+
+def test_bulk_provision_leaves_teardown_to_down_on_cancellation(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    """A concurrent sky down is the sole teardown owner."""
+    monkeypatch.setattr(
+        provisioner, '_bulk_provision',
+        mock.MagicMock(side_effect=KeyboardInterrupt('request cancelled')))
+    monkeypatch.setattr(provisioner, '_cluster_teardown_owns_cancellation',
+                        lambda: True)
+
+    with pytest.raises(KeyboardInterrupt, match='request cancelled'):
+        _call_bulk_provision(tmp_path)
+
+    patched_bulk_provision.assert_not_called()

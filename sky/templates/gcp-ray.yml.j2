@@ -70,6 +70,7 @@ provider:
   # leakage.
   disable_launch_config_check: true
   use_managed_instance_group: {{ gcp_use_managed_instance_group }}
+  _is_tpu_mig: {{ gcp_is_tpu_mig|tojson }}
 {%- if enable_gvnic %}
   enable_gvnic: {{ enable_gvnic }}
 {%- endif %}
@@ -152,6 +153,10 @@ available_node_types:
   {%- endif %}
 {%- else %}
       machineType: {{instance_type}}
+    {%- if threads_per_core is not none %}
+      advancedMachineFeatures:
+        threadsPerCore: {{threads_per_core}}
+    {%- endif %}
     {%- if machine_image is not none %}
       sourceMachineImage: {{machine_image}}
     {%- endif %}
@@ -218,7 +223,7 @@ available_node_types:
             value: |-
               {{ user_data | indent(14) }}
   {%- endif %}
-  {%- if use_spot or gpu is not none %}
+  {%- if use_spot or gpu is not none or is_compute_tpu %}
       scheduling:
   {%- if use_spot %}
         automaticRestart: false
@@ -227,8 +232,8 @@ available_node_types:
         provisioningModel: SPOT
         preemptible: true
   {%- endif %}
-  {%- if gpu is not none %}
-        onHostMaintenance: TERMINATE  # Required for GPU-attached VMs.
+  {%- if gpu is not none or is_compute_tpu %}
+        onHostMaintenance: TERMINATE  # Required for GPU-attached and Compute TPU VMs.
   {%- endif %}
   {%- endif %}
 {%- endif %}
@@ -251,8 +256,14 @@ file_mounts: {
 # items!
 #
 # Increment the following for catching performance bugs easier:
-#   current num items (num SSH connections): 1  (+1 if tpu_vm)
+#   current num items (num SSH connections): 1
+#     (+1 if tpu_vm, +1 for GCP service-account credential migration)
 setup_commands:
+{%- if gcp_service_account_credential_cleanup_command %}
+  # Keep this as a separate fail-fast command: stale user ADC must not shadow
+  # the attached service account.
+  - {{ gcp_service_account_credential_cleanup_command }}
+{%- endif %}
   # Add ~/.ssh/sky-cluster-key to SSH config to allow nodes within a cluster to connect to each other
   # Disable `unattended-upgrades` to prevent apt-get from hanging. It should be called at the beginning before the process started to avoid being blocked. (This is a temporary fix.)
   # Line 'which conda ..': some images (TPU VM) do not install conda by

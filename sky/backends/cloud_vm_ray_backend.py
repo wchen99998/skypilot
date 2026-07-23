@@ -1308,6 +1308,7 @@ class RetryingVmProvisioner(object):
                             zones,
                             resources_utils.ClusterName(
                                 cluster_name, handle.cluster_name_on_cloud),
+                            resources=to_provision,
                             num_nodes=num_nodes,
                             cluster_yaml=handle.cluster_yaml,
                             prev_cluster_ever_up=prev_cluster_ever_up,
@@ -4583,19 +4584,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # should be higher priority than the cluster requests, and we should
             # release the lock from other requests.
             exclude_request_to_kill = 'sky.down' if terminate else 'sky.stop'
-            try:
-                # TODO(zhwu): we should get rid of this when it is being called
-                # internally without involving an API server, e.g., when a
-                # controller is trying to terminate a cluster.
-                requests_lib.kill_cluster_requests(handle.cluster_name,
-                                                   exclude_request_to_kill)
-            except Exception as e:  # pylint: disable=broad-except
-                # We allow the failure to kill other launch requests, because
-                # it is not critical to the cluster teardown.
-                logger.warning(
-                    'Failed to kill other launch requests for the '
-                    f'cluster {handle.cluster_name}: '
-                    f'{common_utils.format_exception(e, use_bracket=True)}')
+            # TODO(zhwu): we should get rid of this when it is being called
+            # internally without involving an API server, e.g., when a
+            # controller is trying to terminate a cluster.
+            cancelled_request_ids = requests_lib.kill_cluster_requests(
+                handle.cluster_name, exclude_request_to_kill)
+            # The worker process is reused, so cancellation is acknowledged
+            # by clearing the request PID rather than by process exit. Do not
+            # force-unlock while the cancelled request could still be issuing
+            # cloud operations. Cancellation or acknowledgement failure
+            # intentionally propagates and aborts teardown.
+            requests_lib.wait_for_request_cancellation(cancelled_request_ids)
             # In case other running cluster operations are still holding the
             # lock.
             lock.force_unlock()
@@ -5351,19 +5350,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # the cluster is terminated/stopped. Otherwise, it will be quite
         # confusing to see the cluster restarted immediately after it is
         # terminated/stopped, when there is a pending launch request.
-        try:
-            # TODO(zhwu): we should get rid of this when it is being called
-            # internally without involving an API server, e.g., when a
-            # controller is trying to terminate a cluster.
-            requests_lib.kill_cluster_requests(handle.cluster_name,
-                                               exclude_request_to_kill)
-        except Exception as e:  # pylint: disable=broad-except
-            # We allow the failure to kill other launch requests, because
-            # it is not critical to the cluster teardown.
-            logger.warning(
-                'Failed to kill other launch requests for the '
-                f'cluster {handle.cluster_name}: '
-                f'{common_utils.format_exception(e, use_bracket=True)}')
+        # TODO(zhwu): we should get rid of this when it is being called
+        # internally without involving an API server, e.g., when a
+        # controller is trying to terminate a cluster.
+        cancelled_request_ids = requests_lib.kill_cluster_requests(
+            handle.cluster_name, exclude_request_to_kill)
+        # This second cancellation closes the race with requests queued while
+        # the cluster lock was being acquired. Do not touch cloud resources
+        # until those executors acknowledge they have stopped.
+        requests_lib.wait_for_request_cancellation(cancelled_request_ids)
         cluster_status_fetched = False
         if refresh_cluster_status:
             try:
@@ -6047,6 +6042,24 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                             f'{current_nodes} node(s). Nothing to do.')
             return
 
+        launched = handle.launched_resources
+        assert launched is not None and launched.cloud is not None
+        config_from_yaml = global_user_state.get_cluster_yaml_dict(
+            handle.cluster_yaml)
+        # get_cluster_yaml_dict can return None if the local cluster YAML is
+        # missing (e.g., ~/.sky/generated was wiped). Treat as empty config.
+        provider_config = (config_from_yaml or {}).get('provider')
+        if (provider_config is not None and
+                provider_config.get('use_managed_instance_group', False) and
+                launched.need_cleanup_after_preemption_or_failure()):
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.NotSupportedError(
+                    'Scaling down a Compute TPU Flex-start managed instance '
+                    'group in place is not supported. It would destroy the '
+                    'healthy TPU slice before the smaller topology is '
+                    'validated. Terminate the cluster and launch a new '
+                    'supported topology instead.')
+
         to_remove = current_nodes - requested_nodes
         logger.info(f'Resizing cluster {cluster_name!r} from {current_nodes} '
                     f'to {requested_nodes} node(s) (-{to_remove} worker(s)).')
@@ -6116,16 +6129,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # logic to pick and terminate specific instance IDs/names. A future
         # optimization would add a `terminate_instances(worker_ids=[...])`
         # API and only remove the excess workers.
-        launched = handle.launched_resources
-        assert launched is not None and launched.cloud is not None
         # Convention in this codebase: use str(cloud).lower() to get the
         # provider name expected by sky.provision (e.g. 'aws', 'gcp').
         cloud_name = str(launched.cloud).lower()
-        config_from_yaml = global_user_state.get_cluster_yaml_dict(
-            handle.cluster_yaml)
-        # get_cluster_yaml_dict can return None if the local cluster YAML is
-        # missing (e.g., ~/.sky/generated was wiped). Treat as empty config.
-        provider_config = (config_from_yaml or {}).get('provider')
 
         logger.info(f'Terminating all workers of cluster {cluster_name!r} so '
                     f'bulk provisioning can recreate {requested_nodes - 1} '

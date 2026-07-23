@@ -104,6 +104,38 @@ def _check_controller_resources(
     assert not expected_infra_list
 
 
+def test_gcp_controller_remote_identity_preserves_cluster_overrides(
+        monkeypatch):
+    monkeypatch.setattr(controller_utils.skypilot_config,
+                        'get_effective_workspace_region_config',
+                        lambda **kwargs: None)
+    original_overrides = {
+        'gcp': {
+            'vpc_name': 'existing-vpc',
+        },
+        'docker': {
+            'run_options': ['--ipc=host'],
+        },
+    }
+    controller_resources = resources_lib.Resources(
+        cloud=clouds.GCP(), _cluster_config_overrides=original_overrides)
+
+    result = controller_utils._with_controller_remote_identity(
+        controller_resources)
+
+    assert result.cluster_config_overrides == {
+        'gcp': {
+            'vpc_name': 'existing-vpc',
+            'remote_identity': controller_utils.schemas.RemoteIdentityOptions.
+                               SERVICE_ACCOUNT.value,
+        },
+        'docker': {
+            'run_options': ['--ipc=host'],
+        },
+    }
+    assert controller_resources.cluster_config_overrides == original_overrides
+
+
 @pytest.mark.parametrize(('controller_type', 'default_controller_resources'), [
     ('jobs', {
         **managed_job_constants.CONTROLLER_RESOURCES,
@@ -116,7 +148,9 @@ def _check_controller_resources(
 ])
 def test_get_controller_resources_with_task_resources(
         controller_type: str, default_controller_resources: Dict[str, Any],
-        enable_all_clouds):
+        enable_all_clouds, monkeypatch):
+    monkeypatch.setattr(controller_utils.global_user_state,
+                        'get_handle_from_cluster_name', lambda _: None)
 
     # 1. All resources has cloud specified. All of them
     # could host controllers. Return a set, each item has
