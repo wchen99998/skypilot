@@ -1319,6 +1319,28 @@ def test_gcp_compute_tpu_flex_start_config_rejects_mismatch(
                                                  num_nodes)
 
 
+def test_gcp_tpu_mig_validation_error_is_structured():
+    with pytest.raises(common.ProvisionerError) as exc_info:
+        instance_utils.GCPManagedInstanceGroup._get_tpu_mig_parameters(
+            {
+                gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+                    'accelerator_topology': '4x8',
+                },
+                'machineType': 'ct6e-standard-1t',
+            },
+            'us-east5-a',
+            32,
+        )
+
+    assert exc_info.value.errors == [{
+        'code': 'UNKNOWN',
+        'domain': 'provisioner',
+        'message': ("Accelerator topology '4x8' is not supported with "
+                    "'ct6e-standard-1t' on Compute Engine. Supported "
+                    'topologies: 1x1.'),
+    }]
+
+
 def _matching_tpu_mig_resources():
     node_config = {
         gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {

@@ -26,7 +26,14 @@ logger = sky_logging.init_logger(__name__)
 
 class ProvisionerError(RuntimeError):
     """Exception for provisioner."""
-    errors: List[Dict[str, str]]
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.errors: List[Dict[str, str]] = [{
+            'code': 'UNKNOWN',
+            'domain': 'provisioner',
+            'message': message,
+        }]
 
 
 class StopFailoverError(Exception):
