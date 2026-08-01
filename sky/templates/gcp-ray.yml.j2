@@ -262,7 +262,8 @@ setup_commands:
 {%- if gcp_service_account_credential_cleanup_command %}
   # Keep this as a separate fail-fast command: stale user ADC must not shadow
   # the attached service account.
-  - {{ gcp_service_account_credential_cleanup_command }}
+  - >-
+    {{ gcp_service_account_credential_cleanup_command }}
 {%- endif %}
   # Add ~/.ssh/sky-cluster-key to SSH config to allow nodes within a cluster to connect to each other
   # Disable `unattended-upgrades` to prevent apt-get from hanging. It should be called at the beginning before the process started to avoid being blocked. (This is a temporary fix.)
