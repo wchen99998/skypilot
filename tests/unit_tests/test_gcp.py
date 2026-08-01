@@ -1553,6 +1553,44 @@ def test_gcp_tpu_mig_reuse_accepts_zero_size_group_without_members():
     assert mismatches == []
 
 
+@pytest.mark.parametrize(
+    ('field', 'value', 'expected_mismatch'),
+    [
+        ('automaticRestart', True, 'automatic restart is not disabled'),
+        ('skipGuestOsShutdown', True, 'skips guest OS shutdown'),
+    ],
+)
+def test_gcp_tpu_mig_reuse_requires_sky_owned_shutdown_policy(
+        field, value, expected_mismatch):
+    instance_template, workload_policy, managed_instance_group = (
+        _matching_tpu_mig_resources())
+    expected_instance_properties = copy.deepcopy(
+        instance_template['properties'])
+    instance_template['properties']['scheduling'][field] = value
+    managed_instance_group['targetSize'] = 0
+    managed_instance_group['status'] = {}
+
+    mismatches = mig_utils.get_tpu_mig_reuse_mismatches(
+        project_id='project',
+        region='us-east5',
+        zone='us-east5-a',
+        total_count=0,
+        machine_type='ct6e-standard-4t',
+        run_duration=3600,
+        accelerator_topology='4x4',
+        accelerator_topology_mode='AUTO_CONNECT',
+        instance_template_name='sky-it-cluster',
+        workload_policy_name='sky-wp-cluster',
+        expected_instance_properties=expected_instance_properties,
+        instance_template=instance_template,
+        workload_policy=workload_policy,
+        managed_instance_group=managed_instance_group,
+        managed_instances=[],
+    )
+
+    assert any(expected_mismatch in mismatch for mismatch in mismatches)
+
+
 def test_gcp_spot_tpu_mig_reuse_requires_automatic_restart_disabled():
     instance_template, workload_policy, managed_instance_group = (
         _matching_tpu_mig_resources(use_spot=True))
