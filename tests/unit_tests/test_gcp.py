@@ -1,3 +1,4 @@
+import copy
 import pathlib
 from unittest.mock import ANY
 from unittest.mock import call
@@ -197,7 +198,7 @@ def test_gcp_mig_instance_template_uses_flex_start(monkeypatch):
     properties = body['properties']
     assert gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG not in properties
     assert properties['description'] == (
-        "SkyPilot instance template for 'cluster' to support DWS requests.")
+        "SkyPilot Flex-start TPU MIG instance template for 'cluster'.")
     assert properties['reservationAffinity'] == {
         'consumeReservationType': 'NO_RESERVATION',
     }
@@ -213,6 +214,31 @@ def test_gcp_mig_instance_template_uses_flex_start(monkeypatch):
         'onHostMaintenance': 'TERMINATE',
         'automaticRestart': False,
         'skipGuestOsShutdown': False,
+    }
+
+
+def test_gcp_mig_instance_template_preserves_spot():
+    node_config = {
+        gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+            'run_duration': 3600,
+        },
+        'machineType': 'ct6e-standard-4t',
+        'scheduling': {
+            'provisioningModel': 'SPOT',
+            'preemptible': True,
+        },
+    }
+
+    properties = mig_utils.make_region_instance_template_properties(
+        'cluster', node_config)
+
+    assert properties['description'] == (
+        "SkyPilot Spot TPU MIG instance template for 'cluster'.")
+    assert properties['scheduling'] == {
+        'provisioningModel': 'SPOT',
+        'instanceTerminationAction': 'STOP',
+        'onHostMaintenance': 'TERMINATE',
+        'automaticRestart': False,
     }
 
 
@@ -942,9 +968,10 @@ def test_gcp_compute_tpu_boot_disk_uses_hyperdisk_balanced(instance_type):
                                   disk_tier) == 'hyperdisk-balanced'
 
 
-def test_gcp_compute_tpu_mig_disables_stop_and_spot():
+def test_gcp_compute_tpu_mig_disables_stop_but_supports_spot():
     resource = resources.Resources(cloud=GCP(),
                                    instance_type='tpu7x-standard-4t',
+                                   use_spot=True,
                                    region='us-central1',
                                    _cluster_config_overrides={
                                        'gcp': {
@@ -959,7 +986,21 @@ def test_gcp_compute_tpu_mig_disables_stop_and_spot():
 
     assert cloud_lib.CloudImplementationFeatures.STOP in unsupported
     assert cloud_lib.CloudImplementationFeatures.AUTOSTOP in unsupported
+    assert cloud_lib.CloudImplementationFeatures.SPOT_INSTANCE not in (
+        unsupported)
+
+
+def test_gcp_compute_tpu_spot_requires_mig_config():
+    resource = resources.Resources(cloud=GCP(),
+                                   instance_type='ct6e-standard-1t',
+                                   use_spot=True,
+                                   region='us-west1')
+
+    unsupported = GCP._unsupported_features_for_resources(resource)
+
     assert cloud_lib.CloudImplementationFeatures.SPOT_INSTANCE in unsupported
+    assert 'gcp.managed_instance_group' in unsupported[
+        cloud_lib.CloudImplementationFeatures.SPOT_INSTANCE]
 
 
 def test_gcp_compute_tpu_mig_marks_provider_for_cleanup():
@@ -1071,6 +1112,29 @@ def test_gcp_compute_tpu_flex_start_cost_uses_dws_price(instance_type):
 
     assert flex_start.get_cost(3600) == pytest.approx(
         on_demand.get_cost(3600) * 0.5)
+
+
+@pytest.mark.parametrize(('instance_type', 'region'),
+                         [('ct6e-standard-4t', 'us-west1'),
+                          ('tpu7x-standard-4t', 'us-central1')])
+def test_gcp_compute_tpu_spot_mig_cost_is_not_discounted_twice(
+        instance_type, region):
+    spot = resources.Resources(cloud=GCP(),
+                               instance_type=instance_type,
+                               use_spot=True,
+                               region=region,
+                               _cluster_config_overrides={
+                                   'gcp': {
+                                       'managed_instance_group': {
+                                           'run_duration': 3600,
+                                           'accelerator_topology': '4x4',
+                                       },
+                                   },
+                               })
+
+    assert spot.get_cost(3600) == pytest.approx(
+        gcp_catalog.get_hourly_cost(instance_type, use_spot=True,
+                                    region=region))
 
 
 def test_gcp_mig_resource_names_fit_gce_limit():
@@ -1288,19 +1352,37 @@ def test_gcp_tpu_mig_waits_for_running_status_after_stable(monkeypatch):
     ('ct6e-standard-1t', 'us-east5-a', '1x1', 1),
     ('ct6e-standard-4t', 'us-east5-a', '2x2', 1),
     ('ct6e-standard-4t', 'us-east5-a', '4x8', 8),
+    ('ct6e-standard-4t', 'europe-west4-a', '4x8', 8),
     ('ct6e-standard-8t-tpu', 'us-east5-a', '2x4', 1),
     ('tpu7x-standard-4t', 'us-central1-c', '2x2x1', 1),
     ('tpu7x-standard-4t-tpu', 'us-central1-c', '2x4x4', 8),
 ])
 def test_gcp_compute_tpu_flex_start_config_validates(machine_type, zone,
                                                      topology, num_nodes):
-    mig_utils.validate_tpu_flex_start_config(machine_type, zone, topology,
-                                             num_nodes)
+    mig_utils.validate_tpu_mig_config(machine_type,
+                                      zone,
+                                      topology,
+                                      num_nodes,
+                                      use_spot=False)
+
+
+@pytest.mark.parametrize(('machine_type', 'zone', 'topology', 'num_nodes'), [
+    ('ct6e-standard-1t', 'us-west1-c', '1x1', 1),
+    ('ct6e-standard-4t', 'us-east5-b', '4x8', 8),
+    ('tpu7x-standard-4t', 'us-central1-c', '2x2x2', 2),
+])
+def test_gcp_compute_tpu_spot_config_validates(machine_type, zone, topology,
+                                               num_nodes):
+    mig_utils.validate_tpu_mig_config(machine_type,
+                                      zone,
+                                      topology,
+                                      num_nodes,
+                                      use_spot=True)
 
 
 @pytest.mark.parametrize(
     ('machine_type', 'zone', 'topology', 'num_nodes', 'error'), [
-        ('ct6e-standard-4t', 'us-east5-b', '4x8', 8,
+        ('ct6e-standard-4t', 'us-west1-c', '4x8', 8,
          'does not support TPU Flex-start'),
         ('ct6e-standard-4t', 'us-east5-a', '2x2x2', 2,
          'requires a 2D accelerator topology'),
@@ -1317,8 +1399,25 @@ def test_gcp_compute_tpu_flex_start_config_validates(machine_type, zone,
 def test_gcp_compute_tpu_flex_start_config_rejects_mismatch(
         machine_type, zone, topology, num_nodes, error):
     with pytest.raises(ValueError, match=error):
-        mig_utils.validate_tpu_flex_start_config(machine_type, zone, topology,
-                                                 num_nodes)
+        mig_utils.validate_tpu_mig_config(machine_type,
+                                          zone,
+                                          topology,
+                                          num_nodes,
+                                          use_spot=False)
+
+
+@pytest.mark.parametrize(('zone', 'use_spot', 'error'), [
+    ('us-west1-c', False, 'does not support TPU Flex-start'),
+    ('us-south1-ai1b', True, 'does not support TPU Spot'),
+])
+def test_gcp_compute_tpu_mig_config_rejects_wrong_consumption_zone(
+        zone, use_spot, error):
+    with pytest.raises(ValueError, match=error):
+        mig_utils.validate_tpu_mig_config('ct6e-standard-4t',
+                                          zone,
+                                          '4x4',
+                                          4,
+                                          use_spot=use_spot)
 
 
 def test_gcp_tpu_mig_validation_error_is_structured():
@@ -1343,7 +1442,7 @@ def test_gcp_tpu_mig_validation_error_is_structured():
     }]
 
 
-def _matching_tpu_mig_resources():
+def _matching_tpu_mig_resources(use_spot=False):
     node_config = {
         gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
             'run_duration': 3600,
@@ -1356,6 +1455,10 @@ def _matching_tpu_mig_resources():
             'skypilot-head-node': '0',
         },
     }
+    if use_spot:
+        node_config['scheduling'] = {
+            'provisioningModel': 'SPOT',
+        }
     instance_template = {
         'properties': mig_utils.make_region_instance_template_properties(
             'cluster', node_config),
@@ -1450,18 +1553,12 @@ def test_gcp_tpu_mig_reuse_accepts_zero_size_group_without_members():
     assert mismatches == []
 
 
-@pytest.mark.parametrize(
-    ('field', 'value', 'expected_mismatch'),
-    [
-        ('automaticRestart', True, 'automatic restart is not disabled'),
-        ('skipGuestOsShutdown', True, 'skips guest OS shutdown'),
-    ],
-)
-def test_gcp_tpu_mig_reuse_requires_sky_owned_shutdown_policy(
-        field, value, expected_mismatch):
+def test_gcp_spot_tpu_mig_reuse_requires_automatic_restart_disabled():
     instance_template, workload_policy, managed_instance_group = (
-        _matching_tpu_mig_resources())
-    instance_template['properties']['scheduling'][field] = value
+        _matching_tpu_mig_resources(use_spot=True))
+    expected_instance_properties = copy.deepcopy(
+        instance_template['properties'])
+    instance_template['properties']['scheduling']['automaticRestart'] = True
     managed_instance_group['targetSize'] = 0
     managed_instance_group['status'] = {}
 
@@ -1476,14 +1573,15 @@ def test_gcp_tpu_mig_reuse_requires_sky_owned_shutdown_policy(
         accelerator_topology_mode='AUTO_CONNECT',
         instance_template_name='sky-it-cluster',
         workload_policy_name='sky-wp-cluster',
-        expected_instance_properties=instance_template['properties'],
+        expected_instance_properties=expected_instance_properties,
         instance_template=instance_template,
         workload_policy=workload_policy,
         managed_instance_group=managed_instance_group,
         managed_instances=[],
     )
 
-    assert any(expected_mismatch in mismatch for mismatch in mismatches)
+    assert any('automatic restart is not disabled' in mismatch
+               for mismatch in mismatches)
 
 
 @pytest.mark.parametrize(('status_path', 'expected_mismatch'), [
@@ -2085,6 +2183,7 @@ def test_gcp_tpu_mig_cleanup_deletes_all_resources(monkeypatch, mig_exists):
                 'name': 'delete-mig-op',
             }, 'project'), {
                 'region': 'us-east5',
+                'timeout': 3600,
             }),
         ])
     expected_calls.extend([
@@ -2333,13 +2432,14 @@ def test_gcp_ct6e_catalog_entries_use_documented_regions():
                                                              use_spot=False)
 
     expected_region_to_zones = {
-        'us-central1': ('us-central1-b',),
+        'us-central1': ('us-central1-a', 'us-central1-b'),
         'us-east1': ('us-east1-d',),
         'us-east5': ('us-east5-a', 'us-east5-b'),
         'us-south1': ('us-south1-ai1b',),
         'asia-northeast1': ('asia-northeast1-b',),
         'europe-west4': ('europe-west4-a',),
         'southamerica-west1': ('southamerica-west1-a',),
+        'us-west1': ('us-west1-c',),
     }
     assert [region.name for region in regions] == list(expected_region_to_zones)
     assert {
@@ -2350,9 +2450,12 @@ def test_gcp_ct6e_catalog_entries_use_documented_regions():
 
 @pytest.mark.parametrize(('instance_type', 'expected_region_to_zones'), [
     ('ct6e-standard-4t', {
-        'us-east5': ('us-east5-a',),
+        'us-central1': ('us-central1-a',),
+        'us-east5': ('us-east5-a', 'us-east5-b'),
         'us-south1': ('us-south1-ai1b',),
         'asia-northeast1': ('asia-northeast1-b',),
+        'europe-west4': ('europe-west4-a',),
+        'southamerica-west1': ('southamerica-west1-a',),
     }),
     ('tpu7x-standard-4t', {
         'us-central1': ('us-central1-c',),
@@ -2374,6 +2477,46 @@ def test_gcp_compute_tpu_mig_offerings_use_flex_start_zones(
     regions = GCP.regions_with_offering(instance_type,
                                         accelerators=None,
                                         use_spot=False,
+                                        region=None,
+                                        zone=None,
+                                        resources=resource)
+
+    assert {
+        region.name: tuple(zone.name for zone in region.zones)
+        for region in regions
+    } == expected_region_to_zones
+
+
+@pytest.mark.parametrize(('instance_type', 'expected_region_to_zones'), [
+    ('ct6e-standard-4t', {
+        'us-west1': ('us-west1-c',),
+        'us-east5': ('us-east5-a', 'us-east5-b'),
+        'us-central1': ('us-central1-b',),
+        'us-east1': ('us-east1-d',),
+        'asia-northeast1': ('asia-northeast1-b',),
+        'europe-west4': ('europe-west4-a',),
+    }),
+    ('tpu7x-standard-4t', {
+        'us-central1': ('us-central1-c',),
+    }),
+])
+def test_gcp_compute_tpu_spot_mig_offerings(instance_type,
+                                            expected_region_to_zones):
+    resource = resources.Resources(cloud=GCP(),
+                                   instance_type=instance_type,
+                                   use_spot=True,
+                                   _cluster_config_overrides={
+                                       'gcp': {
+                                           'managed_instance_group': {
+                                               'run_duration': 3600,
+                                               'accelerator_topology': '2x4',
+                                           },
+                                       },
+                                   })
+
+    regions = GCP.regions_with_offering(instance_type,
+                                        accelerators=None,
+                                        use_spot=True,
                                         region=None,
                                         zone=None,
                                         resources=resource)
@@ -2414,11 +2557,25 @@ def test_gcp_ct6e_catalog_uses_tpu_v6e_price(monkeypatch):
     assert calls == [('tpu-v6e-8', 1, False, 'us-east5', None)]
 
 
-def test_gcp_ct6e_spot_is_not_launchable():
-    assert gcp_catalog.get_region_zones_for_instance_type('ct6e-standard-8t',
-                                                          use_spot=True) == []
-    with pytest.raises(ValueError, match='do not support spot'):
-        gcp_catalog.get_hourly_cost('ct6e-standard-8t', use_spot=True)
+def test_gcp_ct6e_spot_catalog_uses_accelerator_price(monkeypatch):
+    calls = []
+
+    def mock_accelerator_hourly_cost(accelerator,
+                                     count,
+                                     use_spot=False,
+                                     region=None,
+                                     zone=None):
+        calls.append((accelerator, count, use_spot, region, zone))
+        return 42.0
+
+    monkeypatch.setattr(gcp_catalog, 'get_accelerator_hourly_cost',
+                        mock_accelerator_hourly_cost)
+
+    assert gcp_catalog.get_hourly_cost('ct6e-standard-8t',
+                                       use_spot=True,
+                                       region='us-west1',
+                                       zone='us-west1-c') == 42.0
+    assert calls == [('tpu-v6e-8', 1, True, 'us-west1', None)]
 
 
 def test_gcp_tpu7x_catalog_entries():
@@ -2442,11 +2599,16 @@ def test_gcp_tpu7x_catalog_entries():
         None, 'us-central1-ai1a') == ('us-central1', 'us-central1-ai1a')
 
 
-def test_gcp_tpu7x_spot_is_not_launchable():
-    assert gcp_catalog.get_region_zones_for_instance_type('tpu7x-standard-4t',
-                                                          use_spot=True) == []
-    with pytest.raises(ValueError, match='do not support spot'):
-        gcp_catalog.get_hourly_cost('tpu7x-standard-4t', use_spot=True)
+def test_gcp_tpu7x_spot_catalog_entries():
+    regions = gcp_catalog.get_region_zones_for_instance_type(
+        'tpu7x-standard-4t', use_spot=True)
+
+    assert [region.name for region in regions] == ['us-central1']
+    assert [zone.name for zone in regions[0].zones] == ['us-central1-c']
+    assert gcp_catalog.get_hourly_cost('tpu7x-standard-4t',
+                                       use_spot=True,
+                                       region='us-central1',
+                                       zone='us-central1-c') == 18.24
 
 
 @pytest.mark.parametrize(

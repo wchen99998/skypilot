@@ -171,6 +171,32 @@ resubmitting the request or losing its queue position. Set
 The standalone zonal Flex-start VM request-validity limit does not apply to
 this TPU bulk-MIG workflow.
 
+The TPU MIG path also supports Spot slices. Set ``resources.use_spot: true``;
+SkyPilot keeps the TPU workload policy and bulk target-size behavior, while
+creating a Spot instance template. For example:
+
+.. code-block:: yaml
+
+    config:
+      gcp:
+        managed_instance_group:
+          run_duration: 3600  # Ignored for Spot.
+          provision_timeout: 1800
+          accelerator_topology: 1x1
+
+    resources:
+      infra: gcp/us-west1/us-west1-c
+      instance_type: ct6e-standard-1t
+      use_spot: true
+
+Google can preempt a Spot TPU slice at any time and the MIG does not recreate
+it. Use ``sky jobs launch`` for SkyPilot-managed recovery.
+
+See Google's `multi-host TPU MIG documentation
+<https://docs.cloud.google.com/compute/docs/tpus/create-tpu-mig-multi-host-slice>`__
+and `Spot MIG documentation
+<https://docs.cloud.google.com/compute/docs/instance-groups/create-mig-with-spot-vms>`__.
+
 See :ref:`config-yaml` for more details.
 
 In case you want to specify the DWS configuration for each job/cluster, you can also specify the configuration in the SkyPilot task YAML (see :ref:`here <config-client-job-task-yaml>`):

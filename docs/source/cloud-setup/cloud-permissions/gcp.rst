@@ -163,7 +163,7 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
     tpu.nodes.update
     tpu.operations.get
 
-6. **Optional**: To use Compute Engine TPU Flex-start with
+6. **Optional**: To use Compute Engine TPU Flex-start or Spot MIGs with
    ``gcp.managed_instance_group``, add the following permissions. SkyPilot
    checks these permissions before submitting the regional instance template,
    workload policy, and bulk MIG:

@@ -157,13 +157,22 @@ _CT6E_TPU_VM_SPECS = {
     'ct6e-standard-8t-tpu': (360, 1440, 8),
 }
 _CT6E_REGION_TO_ZONES = {
-    'us-central1': ('us-central1-b',),
+    'us-central1': ('us-central1-a', 'us-central1-b'),
     'us-east1': ('us-east1-d',),
     'us-east5': ('us-east5-a', 'us-east5-b'),
     'us-south1': ('us-south1-ai1b',),
     'asia-northeast1': ('asia-northeast1-b',),
     'europe-west4': ('europe-west4-a',),
     'southamerica-west1': ('southamerica-west1-a',),
+    'us-west1': ('us-west1-c',),
+}
+_CT6E_SPOT_REGION_TO_ZONES = {
+    'us-west1': ('us-west1-c',),
+    'us-east5': ('us-east5-a', 'us-east5-b'),
+    'us-central1': ('us-central1-b',),
+    'us-east1': ('us-east1-d',),
+    'asia-northeast1': ('asia-northeast1-b',),
+    'europe-west4': ('europe-west4-a',),
 }
 _TPU7X_TPU_VM_SPECS = {
     'tpu7x-standard-4t': (224, 960, 4),
@@ -172,9 +181,16 @@ _TPU7X_TPU_VM_SPECS = {
 _TPU7X_REGION_TO_ZONES = {
     'us-central1': ('us-central1-ai1a', 'us-central1-c'),
 }
+_TPU7X_SPOT_REGION_TO_ZONES = {
+    'us-central1': ('us-central1-c',),
+}
 # Source: https://cloud.google.com/tpu/pricing
 _TPU7X_ON_DEMAND_PRICE_PER_CHIP = {
     'us-central1': 12.0,
+}
+# Source: Cloud Billing Catalog SKU 1702-1849-69E4. Spot prices are dynamic.
+_TPU7X_SPOT_PRICE_PER_CHIP = {
+    'us-central1': 4.56,
 }
 _COMPUTE_TPU_VM_SPECS = {
     **_CT6E_TPU_VM_SPECS,
@@ -189,9 +205,8 @@ def _get_ct6e_tpu_accelerator(instance_type: str) -> Tuple[str, int]:
 
 def _get_ct6e_hourly_cost(instance_type: str, use_spot: bool,
                           region: Optional[str], zone: Optional[str]) -> float:
-    if use_spot:
-        with ux_utils.print_exception_no_traceback():
-            raise ValueError('CT6e TPU VMs do not support spot instances.')
+    region_to_zones = (_CT6E_SPOT_REGION_TO_ZONES
+                       if use_spot else _CT6E_REGION_TO_ZONES)
 
     if zone is not None:
         zone_region = zone.rpartition('-')[0]
@@ -201,8 +216,8 @@ def _get_ct6e_hourly_cost(instance_type: str, use_spot: bool,
         region = zone_region
 
     if region is not None:
-        if (region not in _CT6E_REGION_TO_ZONES or
-                zone is not None and zone not in _CT6E_REGION_TO_ZONES[region]):
+        if (region not in region_to_zones or
+                zone is not None and zone not in region_to_zones[region]):
             region_or_zone = f'zone {zone!r}' if zone is not None else (
                 f'region {region!r}')
             with ux_utils.print_exception_no_traceback():
@@ -211,22 +226,22 @@ def _get_ct6e_hourly_cost(instance_type: str, use_spot: bool,
         accelerator, count = _get_ct6e_tpu_accelerator(instance_type)
         return get_accelerator_hourly_cost(accelerator,
                                            count,
-                                           use_spot=False,
+                                           use_spot=use_spot,
                                            region=region)
 
     accelerator, count = _get_ct6e_tpu_accelerator(instance_type)
     return min(
         get_accelerator_hourly_cost(
-            accelerator, count, use_spot=False, region=ct6e_region)
-        for ct6e_region in _CT6E_REGION_TO_ZONES)
+            accelerator, count, use_spot=use_spot, region=ct6e_region)
+        for ct6e_region in region_to_zones)
 
 
 def _get_tpu7x_hourly_cost(instance_type: str, use_spot: bool,
                            region: Optional[str], zone: Optional[str]) -> float:
-    if use_spot:
-        with ux_utils.print_exception_no_traceback():
-            raise ValueError('TPU7x VMs do not support spot instances in '
-                             'SkyPilot.')
+    region_to_zones = (_TPU7X_SPOT_REGION_TO_ZONES
+                       if use_spot else _TPU7X_REGION_TO_ZONES)
+    price_per_chip = (_TPU7X_SPOT_PRICE_PER_CHIP
+                      if use_spot else _TPU7X_ON_DEMAND_PRICE_PER_CHIP)
 
     if zone is not None:
         zone_region = zone.rpartition('-')[0]
@@ -235,18 +250,18 @@ def _get_tpu7x_hourly_cost(instance_type: str, use_spot: bool,
                 raise ValueError(f'Zone {zone!r} is not in region {region!r}.')
         region = zone_region
     if region is not None:
-        if (region not in _TPU7X_REGION_TO_ZONES or zone is not None and
-                zone not in _TPU7X_REGION_TO_ZONES[region]):
+        if (region not in region_to_zones or
+                zone is not None and zone not in region_to_zones[region]):
             region_or_zone = (f'zone {zone!r}'
                               if zone is not None else f'region {region!r}')
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Instance type {instance_type!r} not found '
                                  f'in {region_or_zone}.')
     else:
-        region = next(iter(_TPU7X_ON_DEMAND_PRICE_PER_CHIP))
+        region = next(iter(price_per_chip))
 
     _, _, chips = _TPU7X_TPU_VM_SPECS[instance_type]
-    return _TPU7X_ON_DEMAND_PRICE_PER_CHIP[region] * chips
+    return price_per_chip[region] * chips
 
 
 # Number of CPU cores per GPU based on the AWS setting.
@@ -532,20 +547,20 @@ def validate_region_zone(
 def get_region_zones_for_instance_type(instance_type: str,
                                        use_spot: bool) -> List['cloud.Region']:
     if instance_type in _CT6E_TPU_VM_SPECS:
-        if use_spot:
-            return []
+        region_to_zones = (_CT6E_SPOT_REGION_TO_ZONES
+                           if use_spot else _CT6E_REGION_TO_ZONES)
         return [
             Region(region).set_zones([Zone(zone)
                                       for zone in zones])
-            for region, zones in _CT6E_REGION_TO_ZONES.items()
+            for region, zones in region_to_zones.items()
         ]
     if instance_type in _TPU7X_TPU_VM_SPECS:
-        if use_spot:
-            return []
+        region_to_zones = (_TPU7X_SPOT_REGION_TO_ZONES
+                           if use_spot else _TPU7X_REGION_TO_ZONES)
         return [
             Region(region).set_zones([Zone(zone)
                                       for zone in zones])
-            for region, zones in _TPU7X_REGION_TO_ZONES.items()
+            for region, zones in region_to_zones.items()
         ]
     df = _df[_df['InstanceType'] == instance_type]
     return common.get_region_zones(df, use_spot)

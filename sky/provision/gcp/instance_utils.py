@@ -1050,6 +1050,7 @@ class GCPComputeInstance(GCPInstance):
 class GCPManagedInstanceGroup(GCPComputeInstance):
     """Handler for GCP Managed Instance Group."""
 
+    _TPU_MIG_DELETE_TIMEOUT_SECONDS = 3600
     _TPU_MIG_CLEANUP_RECONCILIATION_SECONDS = 10
     _TPU_MIG_CLEANUP_POLL_INTERVAL_SECONDS = 1
 
@@ -1083,12 +1084,12 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
             'accelerator_topology')
         if accelerator_topology is None:
             raise common.ProvisionerError(
-                'TPU DWS MIG requires '
+                'TPU MIG requires '
                 'gcp.managed_instance_group.accelerator_topology.')
         try:
-            mig_utils.validate_tpu_flex_start_config(config['machineType'],
-                                                     zone, accelerator_topology,
-                                                     total_count)
+            mig_utils.validate_tpu_mig_config(
+                config['machineType'], zone, accelerator_topology, total_count,
+                mig_utils.is_spot_instance_config(config))
         except ValueError as e:
             raise common.ProvisionerError(str(e)) from e
         accelerator_topology_mode = managed_instance_group_config.get(
@@ -1157,7 +1158,7 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
         if ((instance_template_exists or workload_policy_exists or mig_exists)
                 and reuse_mismatches):
             logger.warning(
-                'Existing TPU Flex-start resources for %r do not match the '
+                'Existing TPU MIG resources for %r do not match the '
                 'requested slice; deleting them before reuse: %s', cluster_name,
                 '; '.join(reuse_mismatches))
             cls.delete_tpu_mig_resources(project_id, region, cluster_name)
@@ -1222,7 +1223,7 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                 permission_list = '\n'.join(
                     f'    {permission}' for permission in missing_permissions)
                 raise common.ProvisionerError(
-                    'GCP TPU Flex-start MIG provisioning is missing these IAM '
+                    'GCP TPU MIG provisioning is missing these IAM '
                     f'permissions in project {project_id!r}:\n'
                     f'{permission_list}\n'
                     'Grant roles/compute.instanceAdmin.v1 (and '
@@ -1246,7 +1247,7 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
             if not mig_exists and count not in (0, total_count):
                 if not replaced_incompatible_mig:
                     raise common.ProvisionerError(
-                        'TPU DWS MIG requires creating the full accelerator '
+                        'TPU MIG requires creating the full accelerator '
                         f'topology at once. Got count={count}, '
                         f'total_count={total_count}.')
                 # Members of the incompatible MIG can make the caller's count
@@ -1443,7 +1444,13 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                 logger.debug(f'Deleting regional MIG {mig_name!r} ...')
                 operation = mig_utils.delete_region_managed_instance_group(
                     project_id, region, mig_name)
-                cls.wait_for_operation(operation, project_id, region=region)
+                # Cancelling a pending bulk TPU allocation can take longer
+                # than the generic five-minute Compute operation timeout.
+                cls.wait_for_operation(
+                    operation,
+                    project_id,
+                    region=region,
+                    timeout=cls._TPU_MIG_DELETE_TIMEOUT_SECONDS)
             else:
                 mig_exists_and_deleted = False
         except gcp.http_error_exception() as e:

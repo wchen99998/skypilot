@@ -40,8 +40,24 @@ TPU_MIG_WORKLOAD_POLICY_TYPE = 'HIGH_THROUGHPUT'
 _TPU_FLEX_START_ZONES = {
     'ct6e': {
         'asia-northeast1-b',
+        'europe-west4-a',
+        'southamerica-west1-a',
+        'us-central1-a',
         'us-east5-a',
+        'us-east5-b',
         'us-south1-ai1b',
+    },
+    'tpu7x': {'us-central1-c',},
+}
+_TPU_SPOT_ZONES = {
+    'ct6e': {
+        'asia-northeast1-b',
+        'europe-west4-a',
+        'us-central1-b',
+        'us-east1-d',
+        'us-east5-a',
+        'us-east5-b',
+        'us-west1-c',
     },
     'tpu7x': {'us-central1-c',},
 }
@@ -210,10 +226,15 @@ def is_compute_tpu_machine_type(machine_type: str) -> bool:
     return machine_type.startswith(COMPUTE_TPU_MACHINE_TYPE_PREFIXES)
 
 
-def validate_tpu_flex_start_config(machine_type: str, zone: str,
-                                   accelerator_topology: str,
-                                   total_count: int) -> None:
-    """Validate a Compute Engine TPU Flex-start slice configuration."""
+def is_spot_instance_config(node_config: Dict[str, Any]) -> bool:
+    return (node_config.get('scheduling',
+                            {}).get('provisioningModel') == 'SPOT')
+
+
+def validate_tpu_mig_config(machine_type: str, zone: str,
+                            accelerator_topology: str, total_count: int,
+                            use_spot: bool) -> None:
+    """Validate a Compute Engine TPU MIG slice configuration."""
     if is_ct6e_machine_type(machine_type):
         tpu_series = 'ct6e'
         topology_dimensions = 2
@@ -224,11 +245,14 @@ def validate_tpu_flex_start_config(machine_type: str, zone: str,
         raise ValueError(
             f'Unsupported Compute Engine TPU machine type {machine_type!r}.')
 
-    flex_start_zones = _TPU_FLEX_START_ZONES[tpu_series]
-    if zone not in flex_start_zones:
-        zones = ', '.join(sorted(flex_start_zones))
+    supported_zones = (_TPU_SPOT_ZONES[tpu_series]
+                       if use_spot else _TPU_FLEX_START_ZONES[tpu_series])
+    if zone not in supported_zones:
+        provisioning_model = 'Spot' if use_spot else 'Flex-start'
+        zones = ', '.join(sorted(supported_zones))
         raise ValueError(
-            f'{machine_type!r} does not support TPU Flex-start in {zone!r}. '
+            f'{machine_type!r} does not support TPU {provisioning_model} '
+            f'in {zone!r}. '
             f'Use one of: {zones}.')
 
     if not _TPU_TOPOLOGY_PATTERN.fullmatch(accelerator_topology):
@@ -294,38 +318,48 @@ def check_instance_template_exits(project_id: str, region: str,
 def make_region_instance_template_properties(
         cluster_name_on_cloud: str, node_config: Dict[str,
                                                       Any]) -> Dict[str, Any]:
-    """Build the intended properties for a TPU Flex-start template."""
+    """Build the intended properties for a TPU MIG template."""
     config = copy.deepcopy(node_config)
     managed_instance_group_config = config.pop(
         constants.MANAGED_INSTANCE_GROUP_CONFIG, None)
     assert managed_instance_group_config is not None, (
-        'Managed instance group config is required for DWS.')
+        'Managed instance group config is required.')
 
-    scheduling = config.get('scheduling', {})
-    assert scheduling.get('provisioningModel') != 'SPOT', (
-        'DWS does not support spot VMs.')
-    config['scheduling'] = {
-        'provisioningModel': 'FLEX_START',
-        'instanceTerminationAction': 'DELETE',
-        'maxRunDuration': {
-            'seconds': str(managed_instance_group_config['run_duration']),
-        },
-        'onHostMaintenance': 'TERMINATE',
-        # SkyPilot owns managed-job recovery. A Compute Engine restart races
-        # with SkyPilot's teardown/relaunch and cannot restore application
-        # state.
-        'automaticRestart': False,
-        # Preserve the longest guest shutdown window supported by Flex-start.
-        # preemptionNoticeDuration is Spot-only and gracefulShutdown cannot be
-        # used by MIG members or VMs with maxRunDuration.
-        'skipGuestOsShutdown': False,
-    }
+    if is_spot_instance_config(config):
+        config['scheduling'] = {
+            'provisioningModel': 'SPOT',
+            # TPU Spot VMs in a MIG require STOP. Compute Engine rejects
+            # DELETE even though it is valid for standalone Spot VMs.
+            'instanceTerminationAction': 'STOP',
+            'onHostMaintenance': 'TERMINATE',
+            'automaticRestart': False,
+        }
+        provisioning_model = 'Spot'
+    else:
+        config['scheduling'] = {
+            'provisioningModel': 'FLEX_START',
+            'instanceTerminationAction': 'DELETE',
+            'maxRunDuration': {
+                'seconds': str(managed_instance_group_config['run_duration']),
+            },
+            'onHostMaintenance': 'TERMINATE',
+            # SkyPilot owns managed-job recovery. A Compute Engine restart
+            # races with SkyPilot's teardown/relaunch and cannot restore
+            # application state.
+            'automaticRestart': False,
+            # Preserve the longest guest shutdown window supported by
+            # Flex-start. preemptionNoticeDuration is Spot-only and
+            # gracefulShutdown cannot be used by MIG members or VMs with
+            # maxRunDuration.
+            'skipGuestOsShutdown': False,
+        }
+        provisioning_model = 'Flex-start'
 
     config.pop('reservationAffinity', None)
     config.pop('reservation_affinity', None)
-    config['description'] = ('SkyPilot instance template for '
-                             f'{cluster_name_on_cloud!r} to support DWS '
-                             'requests.')
+    config['description'] = (
+        f'SkyPilot {provisioning_model} TPU MIG instance template for '
+        f'{cluster_name_on_cloud!r}.')
     config['reservationAffinity'] = {
         'consumeReservationType': 'NO_RESERVATION',
     }
@@ -342,7 +376,7 @@ def create_region_instance_template(cluster_name_on_cloud: str, project_id: str,
                         credentials=None,
                         cache_discovery=False)
     scheduling = node_config.get('scheduling', {})
-    if scheduling:
+    if scheduling and not is_spot_instance_config(node_config):
         logger.warning(
             f'Ignoring scheduling {scheduling} for DWS. DWS requires '
             'Flex-start scheduling.')
@@ -354,7 +388,7 @@ def create_region_instance_template(cluster_name_on_cloud: str, project_id: str,
     if reservations_affinity is not None:
         logger.warning(
             f'Ignoring reservations_affinity {reservations_affinity} '
-            'for DWS.')
+            'for TPU MIG provisioning.')
     properties = make_region_instance_template_properties(
         cluster_name_on_cloud, node_config)
 
@@ -574,7 +608,7 @@ def get_tpu_mig_reuse_mismatches(
         instance_template: Optional[dict], workload_policy: Optional[dict],
         managed_instance_group: Optional[dict],
         managed_instances: Optional[List[Dict[str, Any]]]) -> List[str]:
-    """Return reasons existing TPU Flex-start resources cannot be reused."""
+    """Return reasons existing TPU MIG resources cannot be reused."""
     mismatches = []
     instance_template_path = (
         f'projects/{project_id}/regions/{region}/instanceTemplates/'
@@ -599,22 +633,32 @@ def get_tpu_mig_reuse_mismatches(
         scheduling = properties.get('scheduling', {})
         if not isinstance(scheduling, dict):
             scheduling = {}
-        if scheduling.get('provisioningModel') != 'FLEX_START':
-            mismatches.append('instance template is not FLEX_START')
-        if not _duration_seconds_matches(scheduling.get('maxRunDuration'),
-                                         run_duration):
-            mismatches.append('instance template maxRunDuration does not match '
-                              f'{run_duration} seconds')
-        if scheduling.get('instanceTerminationAction') != 'DELETE':
+        expected_scheduling = expected_instance_properties['scheduling']
+        provisioning_model = expected_scheduling['provisioningModel']
+        if scheduling.get('provisioningModel') != provisioning_model:
+            mismatches.append(f'instance template is not {provisioning_model}')
+        if provisioning_model == 'FLEX_START':
+            if not _duration_seconds_matches(scheduling.get('maxRunDuration'),
+                                             run_duration):
+                mismatches.append(
+                    'instance template maxRunDuration does not match '
+                    f'{run_duration} seconds')
+        elif scheduling.get('maxRunDuration') is not None:
             mismatches.append(
-                'instance template termination action is not DELETE')
+                'Spot instance template has an unexpected maxRunDuration')
+        termination_action = expected_scheduling['instanceTerminationAction']
+        if scheduling.get('instanceTerminationAction') != termination_action:
+            mismatches.append('instance template termination action is not '
+                              f'{termination_action}')
         if scheduling.get('onHostMaintenance') != 'TERMINATE':
             mismatches.append(
                 'instance template host maintenance action is not TERMINATE')
-        if scheduling.get('automaticRestart') is not False:
+        if (expected_scheduling.get('automaticRestart') is False and
+                scheduling.get('automaticRestart') is not False):
             mismatches.append(
                 'instance template automatic restart is not disabled')
-        if scheduling.get('skipGuestOsShutdown') is not False:
+        if (expected_scheduling.get('skipGuestOsShutdown') is False and
+                scheduling.get('skipGuestOsShutdown') is not False):
             mismatches.append('instance template skips guest OS shutdown')
         canonical_machine_type = (machine_type[:-4]
                                   if machine_type.endswith('-tpu') else
@@ -1045,7 +1089,7 @@ def _wait_for_managed_group_to_be_stable(project_id: str, location: str,
 
     def _load_managers() -> Any:
         # Build with credentials=None so google-auth reloads Application Default
-        # Credentials.  This matters when a long-running Flex-start request
+        # Credentials.  This matters when a long-running TPU MIG request
         # outlives a user session and the ADC file is replaced after
         # reauthentication.
         compute = gcp.build('compute',

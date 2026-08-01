@@ -140,7 +140,11 @@ _COMPUTE_TPU_FLEX_START_PRICE_FACTOR = 0.5
 _COMPUTE_TPU_FLEX_START_ZONES = {
     _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[0]: {
         'asia-northeast1-b',
+        'europe-west4-a',
+        'southamerica-west1-a',
+        'us-central1-a',
         'us-east5-a',
+        'us-east5-b',
         'us-south1-ai1b',
     },
     _COMPUTE_TPU_MACHINE_TYPE_PREFIXES[1]: {'us-central1-c'},
@@ -305,20 +309,29 @@ class GCP(clouds.Cloud):
         # TODO(zhwu): We probably need to store the MIG requirement in resources
         # because `skypilot_config` may change for an existing cluster.
         # Clusters created with MIG cannot be stopped.
-        if (skypilot_config.get_effective_region_config(
+        managed_instance_group_config = (
+            skypilot_config.get_effective_region_config(
                 cloud='gcp',
                 region=resources.region,
                 keys=('managed_instance_group',),
-                override_configs=resources.cluster_config_overrides) is not None
-                and _is_managed_instance_group_eligible(resources)):
+                override_configs=resources.cluster_config_overrides))
+        if (is_compute_tpu and resources.use_spot and
+                managed_instance_group_config is None):
+            unsupported[clouds.CloudImplementationFeatures.SPOT_INSTANCE] = (
+                'Compute Engine TPU Spot instances require '
+                'gcp.managed_instance_group.')
+        if (managed_instance_group_config is not None and
+                _is_managed_instance_group_eligible(resources)):
             unsupported[clouds.CloudImplementationFeatures.STOP] = (
                 'Managed Instance Group (MIG) does not support stopping yet.')
             unsupported[clouds.CloudImplementationFeatures.AUTOSTOP] = (
                 'Managed Instance Group (MIG) does not support autostop. Use '
                 'autodown instead.')
-            unsupported[clouds.CloudImplementationFeatures.SPOT_INSTANCE] = (
-                'Managed Instance Group with DWS does not support '
-                'spot instances.')
+            if not is_compute_tpu:
+                unsupported[
+                    clouds.CloudImplementationFeatures.SPOT_INSTANCE] = (
+                        'Managed Instance Group with DWS does not support '
+                        'spot instances.')
 
         unsupported[
             clouds.CloudImplementationFeatures.
@@ -379,7 +392,7 @@ class GCP(clouds.Cloud):
                             regions.append(r1.set_zones(zones))
                         break
 
-        if (resources is not None and
+        if (resources is not None and not use_spot and
                 instance_type.startswith(_COMPUTE_TPU_MACHINE_TYPE_PREFIXES)):
             machine_type_prefix = next(
                 prefix for prefix in _COMPUTE_TPU_MACHINE_TYPE_PREFIXES
@@ -477,7 +490,7 @@ class GCP(clouds.Cloud):
                 keys=('managed_instance_group',),
                 default_value=None,
                 override_configs=resources.cluster_config_overrides))
-        if managed_instance_group_config is None:
+        if managed_instance_group_config is None or resources.use_spot:
             return hourly_cost
         # Google's published DWS Flex-start price is 50% of on-demand for the
         # Compute TPU generations currently exposed here.  Keep the base

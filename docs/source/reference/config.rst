@@ -1316,17 +1316,19 @@ Example:
 ``gcp.managed_instance_group``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Managed instance group / DWS (optional).
+Managed instance group provisioning (optional).
 
 SkyPilot supports launching instances in a managed instance group (MIG)
-with Flex-start provisioning through DWS, offering a better availability.
-This feature is applied when a resource request contains GPU instances or
-GCP TPU VM machine types that support Flex-start MIGs.
+with Flex-start provisioning through DWS. For GCP TPU VM machine types, the
+same setting also enables Spot TPU slices when ``resources.use_spot`` is true.
+SkyPilot creates the required regional bulk MIG and TPU workload policy in
+both cases.
 
 ``run_duration``: Duration for a created instance to be kept alive (in seconds, required).
 This is required for DWS Flex-start provisioning to work properly. After the
 specified duration, the instance will be terminated. The value must be between
-``600`` (10 minutes) and ``604800`` (7 days).
+``600`` (10 minutes) and ``604800`` (7 days). This shared setting remains
+required for Spot TPU MIGs, but Spot provisioning ignores the duration.
 
 ``provision_timeout``: Timeout for provisioning an instance by DWS (in seconds, optional).
 This timeout determines how long SkyPilot will wait for a managed instance
@@ -1350,9 +1352,14 @@ See Google Cloud's `TPU Flex-start documentation
 Defaults to ``AUTO_CONNECT`` when omitted.
 
 Compute Engine TPU Flex-start currently supports TPU v6e machine types in
-``asia-northeast1-b``, ``us-east5-a``, and ``us-south1-ai1b``, and
-``tpu7x-standard-4t`` in ``us-central1-c``. SkyPilot validates the topology
-and VM count against Google's documented `TPU v6e configurations
+``asia-northeast1-b``, ``europe-west4-a``, ``southamerica-west1-a``,
+``us-central1-a``, ``us-east5-a``, ``us-east5-b``, and
+``us-south1-ai1b``. Spot TPU v6e MIGs are available in
+``asia-northeast1-b``, ``europe-west4-a``, ``us-central1-b``,
+``us-east1-d``, ``us-east5-a``, ``us-east5-b``, and ``us-west1-c``.
+Both Flex-start and Spot ``tpu7x-standard-4t`` MIGs are available in
+``us-central1-c``. SkyPilot validates the topology and VM count against
+Google's documented `TPU v6e configurations
 <https://docs.cloud.google.com/tpu/docs/v6e#supported-configurations>`_ and
 `TPU7x configurations
 <https://docs.cloud.google.com/tpu/docs/tpu7x#supported-configurations>`_. In
@@ -1366,7 +1373,8 @@ SkyPilot automatically selects Google's TPU-enabled Ubuntu image for
 is set explicitly. When this setting is active for those Compute TPU machine
 types, SkyPilot's estimated cost uses Google's published DWS Flex-start price
 (currently 50% of the corresponding on-demand price). Without this setting,
-the same machine types retain their on-demand estimate.
+the same machine types retain their on-demand estimate. Spot TPU MIGs use the
+Spot price directly; the Flex-start discount is not applied again.
 
 Default: ``900``.
 
@@ -1399,6 +1407,29 @@ For example, a two-host TPU7x slice uses the ``2x2x2`` topology (8 chips,
     instance_type: tpu7x-standard-4t
 
   num_nodes: 2
+
+For example, a Spot TPU v6e VM in ``us-west1-c`` uses the same TPU MIG
+setting and adds ``use_spot: true``:
+
+.. code-block:: yaml
+
+  config:
+    gcp:
+      managed_instance_group:
+        run_duration: 3600  # Required by the shared MIG config; ignored for Spot.
+        provision_timeout: 1800
+        accelerator_topology: 1x1
+
+  resources:
+    infra: gcp/us-west1/us-west1-c
+    instance_type: ct6e-standard-1t
+    use_spot: true
+
+  num_nodes: 1
+
+Spot TPU slices can be preempted at any time. Google stops the slice and does
+not recreate it in the MIG; use ``sky jobs launch`` when automatic recovery is
+required.
 
 .. _config-yaml-gcp-remote-identity:
 
