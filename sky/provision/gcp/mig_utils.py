@@ -311,6 +311,14 @@ def make_region_instance_template_properties(
             'seconds': str(managed_instance_group_config['run_duration']),
         },
         'onHostMaintenance': 'TERMINATE',
+        # SkyPilot owns managed-job recovery. A Compute Engine restart races
+        # with SkyPilot's teardown/relaunch and cannot restore application
+        # state.
+        'automaticRestart': False,
+        # Preserve the longest guest shutdown window supported by Flex-start.
+        # preemptionNoticeDuration is Spot-only and gracefulShutdown cannot be
+        # used by MIG members or VMs with maxRunDuration.
+        'skipGuestOsShutdown': False,
     }
 
     config.pop('reservationAffinity', None)
@@ -603,6 +611,11 @@ def get_tpu_mig_reuse_mismatches(
         if scheduling.get('onHostMaintenance') != 'TERMINATE':
             mismatches.append(
                 'instance template host maintenance action is not TERMINATE')
+        if scheduling.get('automaticRestart') is not False:
+            mismatches.append(
+                'instance template automatic restart is not disabled')
+        if scheduling.get('skipGuestOsShutdown') is not False:
+            mismatches.append('instance template skips guest OS shutdown')
         canonical_machine_type = (machine_type[:-4]
                                   if machine_type.endswith('-tpu') else
                                   machine_type)
