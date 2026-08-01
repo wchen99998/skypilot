@@ -1847,7 +1847,8 @@ def test_gcp_start_stop():
             f'sky logs {name} 1 --status',  # Ensure the job succeeded.
             f'sky exec {name} examples/gcp_start_stop.yaml',
             f'sky logs {name} 2 --status',  # Ensure the job succeeded.
-            f'sky exec {name} "prlimit -n --pid=\$(pgrep -f \'raylet/raylet --raylet_socket_name\') | grep \'"\'1048576 1048576\'"\'"',  # Ensure the raylet process has the correct file descriptor limit.
+            # Ensure the raylet process has the correct file descriptor limit.
+            smoke_tests_utils.get_check_raylet_nofile_limit_cmd(name),
             f'sky logs {name} 3 --status',  # Ensure the job succeeded.
             f'sky stop -y {name}',
             smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
@@ -1879,7 +1880,8 @@ def test_azure_start_stop():
             f'sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} examples/azure_start_stop.yaml',
             f'sky exec {name} examples/azure_start_stop.yaml',
             f'sky logs {name} 1 --status',  # Ensure the job succeeded.
-            f'sky exec {name} "prlimit -n --pid=\$(pgrep -f \'raylet/raylet --raylet_socket_name\') | grep \'"\'1048576 1048576\'"\'"',  # Ensure the raylet process has the correct file descriptor limit.
+            # Ensure the raylet process has the correct file descriptor limit.
+            smoke_tests_utils.get_check_raylet_nofile_limit_cmd(name),
             f'sky logs {name} 2 --status',  # Ensure the job succeeded.
             f'sky stop -y {name}',
             f'sky start -y {name} -i 1',
@@ -2521,15 +2523,32 @@ def test_kubernetes_pod_failed_mount_escalation():
         test = smoke_tests_utils.Test(
             'kubernetes_pod_failed_mount_escalation',
             [
+                # Pin the launch to a single context: the bad mount
+                # reproduces on every context, so on a multi-context API
+                # server an unpinned launch would fail over context after
+                # context — each attempt consuming the full mount-failure
+                # deadline — and could not exit within the test timeout.
+                # Launch the cloud-cmd helper and pin to the context it
+                # lands on (all three steps are no-ops on a local
+                # single-context server).
+                smoke_tests_utils.launch_cluster_for_cloud_cmd(
+                    'kubernetes', name),
+                # Wait for the helper to be UP so its landed context is
+                # resolvable.
+                smoke_tests_utils.run_cloud_cmd_on_cluster(name, 'true'),
+                smoke_tests_utils.resolve_cloud_cmd_k8s_context_cmd(name),
                 # The launch must exit non-zero on its own (the
                 # mount-failure deadline, ~10 min) — a hang here trips the
                 # test timeout instead.
-                f's=$(sky launch -y -c {name} --infra kubernetes {f.name} '
+                f's=$(sky launch -y -c {name} '
+                f'--infra {smoke_tests_utils.cloud_cmd_landed_k8s_infra(name)} '
+                f'{f.name} '
                 f'2>&1); ret=$?; echo "$s"; [ $ret -ne 0 ] || exit 1; '
                 f'echo "$s" | grep "FailedMount" && '
                 f'echo "$s" | grep "MountVolume.SetUp failed"',
             ],
-            f'sky down -y {name}',
+            f'sky down -y {name} && '
+            f'{smoke_tests_utils.down_cluster_for_cloud_cmd(name)}',
             timeout=25 * 60,
         )
         smoke_tests_utils.run_one_test(test)
@@ -3124,26 +3143,33 @@ def test_kubernetes_stale_pod_cleanup():
         'kubernetes_stale_pod_cleanup',
         [
             # Launch a cluster with memory limits (2GB is enough to boot
-            # but tight enough to OOM on a large allocation).
+            # but tight enough to OOM on a large allocation). It may land on
+            # any context.
             f'sky launch -y -c {name} --infra kubernetes --cpus 1 --memory 2 '
             f'--config kubernetes.set_pod_resource_limits=true',
+            # Pin the cloud-cmd helper to the context the target landed on so
+            # its in-cluster kubectl can see the target's pod.
+            smoke_tests_utils.resolve_k8s_context_cmd(name),
+            smoke_tests_utils.launch_cloud_cmd_on_landed_context(name),
             # OOM the pod by writing 4GB to tmpfs, exceeding the 2GB limit.
             f'sky exec {name} -- dd if=/dev/zero of=/dev/shm/oom bs=1M count=4096 || true',
             # Wait for the pod to enter Failed phase.
-            f'for i in $(seq 1 30); do '
-            f'phase=$(kubectl get pod {head_pod} '
-            f'-o jsonpath=\'{{.status.phase}}\'); '
-            f'echo "attempt $i: phase=$phase"; '
-            f'if [ "$phase" = "Failed" ]; then break; fi; '
-            f'sleep 2; done && '
-            f'test "$phase" = "Failed"',
+            smoke_tests_utils.run_cloud_cmd_on_cluster(
+                name, f'for i in $(seq 1 30); do '
+                f'phase=$(kubectl get pod {head_pod} '
+                f'-o jsonpath=\'{{.status.phase}}\'); '
+                f'echo "attempt $i: phase=$phase"; '
+                f'if [ "$phase" = "Failed" ]; then break; fi; '
+                f'sleep 2; done && '
+                f'test "$phase" = "Failed"'),
             # Refresh state and assert INIT before restart.
             f'sky status {name} -r | grep INIT',
             # sky start should clean up the Failed pod and succeed.
             f'sky start -y {name}',
         ],
-        f'sky down -y {name}',
-        timeout=10 * 60,
+        f'sky down -y {name}; '
+        f'{smoke_tests_utils.down_cluster_for_cloud_cmd(name)}',
+        timeout=15 * 60,
     )
     smoke_tests_utils.run_one_test(test)
 
@@ -3703,9 +3729,17 @@ def test_resize(generic_cloud: str):
     stopped_resize_commands = []
     if generic_cloud != 'kubernetes':
         stopped_resize_commands = [
-            # Stop the (now 1-node) cluster.
+            # Stop the (now 1-node) cluster. Poll for STOPPED instead of
+            # checking `sky status` output once: a background status refresh
+            # that raced with the teardown (its per-cluster lock is
+            # force-unlocked by `sky stop`) can transiently overwrite the
+            # freshly-written STOPPED state with INIT/UNHEALTHY, which
+            # self-corrects on the next refresh.
             f'sky stop -y {name}',
-            f's=$(sky status {name}) && echo "$s" && echo "$s" | grep {name} | grep STOPPED',
+            smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
+                cluster_name=name,
+                cluster_status=[sky.ClusterStatus.STOPPED],
+                timeout=120),
             # --- Resize a STOPPED cluster: scale up (restarts + grows) ---
             f'sky launch -y -c {name} --resize --num-nodes 2',
             f's=$(sky status {name}) && echo "$s" && echo "$s" | grep "2x" && echo "$s" | grep UP',

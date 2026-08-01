@@ -1619,6 +1619,11 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
             'local_queue_name': {
                 'type': 'string',
             },
+            # Seconds a launch may wait for queue admission (pods held by
+            # a scheduling gate) before failing; -1 waits indefinitely.
+            'admission_timeout': {
+                'type': 'integer',
+            },
         },
     },
     # Alias of `kueue.local_queue_name`; `quota.queue` takes precedence
@@ -2083,6 +2088,9 @@ def get_config_schema():
                     'type': 'integer',
                     'minimum': 1,
                 },
+                'submit_as_user': {
+                    'type': 'boolean',
+                },
                 'pricing': _PRICING_SCHEMA,
                 'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
                 'gpu_partition_map': _GPU_PARTITION_MAP_SCHEMA,
@@ -2107,6 +2115,9 @@ def get_config_schema():
                             'poll_interval': {
                                 'type': 'integer',
                                 'minimum': 1,
+                            },
+                            'submit_as_user': {
+                                'type': 'boolean',
                             },
                             'pricing': _PRICING_SCHEMA,
                             'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
@@ -2519,6 +2530,9 @@ def get_config_schema():
                             'properties': {
                                 'local_queue_name': {
                                     'type': 'string',
+                                },
+                                'admission_timeout': {
+                                    'type': 'integer',
                                 },
                             },
                         },

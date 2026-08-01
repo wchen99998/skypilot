@@ -239,6 +239,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'POST'
     },
     {
+        'path': '/slurm_cluster_names',
+        'method': 'POST'
+    },
+    {
         'path': '/status_kubernetes',
         'method': 'GET'
     },
@@ -292,11 +296,6 @@ _DEFAULT_VIEWER_ALLOWLIST = [
     {
         'path': '/upload_v2/blob',
         'method': 'GET'
-    },
-    # /debug/dump_create for diagnose
-    {
-        'path': '/debug/dump_create',
-        'method': 'POST'
     },
     # --- Dashboard / static / auth-flow surface ---
     {
