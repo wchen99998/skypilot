@@ -59,6 +59,7 @@ class TaskCodeGen:
 
     def _add_skylet_imports(self) -> None:
         """Add SkyPilot skylet imports."""
+        assert self.job_id is not None
         self._code.append(
             textwrap.dedent("""\
             from sky.skylet import autostop_lib
@@ -67,6 +68,9 @@ class TaskCodeGen:
             from sky.utils import log_utils
             from sky.utils import subprocess_utils
             """))
+        self._code.append(
+            f'if int(constants.SKYLET_VERSION) >= 43:\n'
+            f'    job_lib.mark_job_driver_started({self.job_id!r})')
 
     def _add_logging_functions(self) -> None:
         """Add log streaming functions from log_lib."""

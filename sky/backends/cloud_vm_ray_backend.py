@@ -20,6 +20,7 @@ import time
 import typing
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
                     Sequence, Set, Tuple, Union)
+import uuid
 
 import colorama
 import psutil
@@ -150,6 +151,7 @@ _NODES_LAUNCHING_PROGRESS_TIMEOUT = {
 # Time gap between retries after failing to provision in all possible places.
 # Used only if --retry-until-up is set.
 _RETRY_UNTIL_UP_INIT_GAP_SECONDS = 30
+_SLURM_SSH_RETRY_WAIT_SECONDS = 60
 
 # The maximum retry count for fetching IP address.
 _FETCH_IP_MAX_ATTEMPTS = 3
@@ -262,6 +264,21 @@ def _format_provision_failure_blocks(
 
 # Number of seconds to wait locking the cluster before communicating with user.
 _CLUSTER_LOCK_TIMEOUT = 5.0
+
+
+def _is_retryable_slurm_ssh_error(error: BaseException) -> bool:
+    """Whether an error chain represents a lost Slurm login-node SSH hop."""
+    current: Optional[BaseException] = error
+    while current is not None:
+        if (isinstance(current, exceptions.CommandError) and
+                current.returncode == 255):
+            return True
+        if isinstance(current, ValueError) and str(current).startswith(
+            ('Failed to get remote home directory:',
+             'Failed to find remote home directory identifier:')):
+            return True
+        current = current.__cause__
+    return False
 
 
 def _is_message_too_long(returncode: int,
@@ -3107,6 +3124,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def __init__(self):
         self.run_timestamp = sky_logging.get_run_timestamp()
+        self._submission_id: Optional[str] = None
         # NOTE: do not expanduser() here, as this '~/...' path is used for
         # remote as well to be expanded on the remote side.
         self.log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY,
@@ -3366,9 +3384,16 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 ux_utils.spinner_message('Preparing SkyPilot runtime')):
             # We need to source bashrc for skylet to make sure the autostop
             # event can access the path to the cloud CLIs.
-            self.run_on_head(handle,
-                             instance_setup.MAYBE_SKYLET_RESTART_CMD,
-                             source_bashrc=True)
+            cmd = instance_setup.MAYBE_SKYLET_RESTART_CMD
+            is_slurm = isinstance(handle.launched_resources.cloud, clouds.Slurm)
+            if is_slurm:
+                cmd = instance_setup.SLURM_SKYLET_WAIT_CMD
+                returncode, stdout, stderr = self.run_on_head(
+                    handle, cmd, source_bashrc=True, require_outputs=True)
+                if returncode:
+                    raise RuntimeError(stdout + stderr)
+            else:
+                self.run_on_head(handle, cmd, source_bashrc=True)
 
     def _locked_provision(
         self,
@@ -4120,7 +4145,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         remote_log_dir: Optional[str] = None,
     ) -> None:
         """Executes generated code on the head node."""
-        use_legacy = not handle.is_grpc_enabled_with_flag
+        is_slurm = isinstance(handle.launched_resources.cloud, clouds.Slurm)
+        use_legacy = is_slurm or not handle.is_grpc_enabled_with_flag
         file_name = f'sky_job_{job_id}'
         script_path = os.path.join(SKY_REMOTE_APP_DIR, file_name)
         if remote_log_dir is None:
@@ -4146,29 +4172,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         mkdir_code = f'mkdir -p {remote_log_dir} && touch {remote_log_path}'
         encoded_script = shlex.quote(codegen)
         create_script_code = f'{{ echo {encoded_script} > {script_path}; }}'
+        job_marker = job_lib.JOB_CMD_IDENTIFIER.format(job_id)
         job_submit_cmd = (
-            # JOB_CMD_IDENTIFIER is used for identifying the process
-            # retrieved with pid is the same driver process.
-            f'{job_lib.JOB_CMD_IDENTIFIER.format(job_id)} && '
-            f'{constants.SKY_PYTHON_CMD} -u {script_path}'
+            f'echo {shlex.quote(job_marker)} && '
+            # Keep the marker in argv after bash execs the Python driver.
+            f'{constants.SKY_PYTHON_CMD} -u {script_path} '
+            f'{shlex.quote(job_marker)}'
             # Do not use &>, which is not POSIX and may not work.
             # Note that the order of ">filename 2>&1" matters.
             f'> {remote_log_path} 2>&1')
-        code = job_lib.JobLibCodeGen.queue_job(job_id, job_submit_cmd)
-
-        # For Slurm, we need to wait for the job to complete before exiting,
-        # because Slurm's proctrack/cgroup kills all processes when the srun
-        # job step ends, including child processes launched as a separate
-        # process group.
-        # So this keeps srun alive so the job driver process that was spawned
-        # (and runs in the background) by job_lib.JobScheduler.schedule_step()
-        # does not get killed.
-        # Note: proctrack/cgroup is enabled by default on Nebius' Managed
-        # Soperator.
-        is_slurm = isinstance(handle.launched_resources.cloud, clouds.Slurm)
-        if is_slurm:
-            wait_code = job_lib.JobLibCodeGen.wait_for_job(job_id)
-            code = code + ' && ' + wait_code
+        # Slurm's transient srun step must not own the trainer: proctrack/cgroup
+        # kills all of a step's descendants when that step exits. Enqueue only;
+        # the allocation-owned Skylet scheduler launches the trainer.
+        code = job_lib.JobLibCodeGen.queue_job(job_id,
+                                               job_submit_cmd,
+                                               schedule=not is_slurm)
 
         job_submit_cmd = ' && '.join([mkdir_code, create_script_code, code])
 
@@ -4248,15 +4266,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 _dump_code_to_file(codegen)
                 job_submit_cmd = f'{mkdir_code} && {code}'
 
-            # For Slurm, run in background so that SSH returns immediately.
-            # This is needed because we add the wait_for_job code above which
-            # makes the command block until the job completes.
             returncode, stdout, stderr = self.run_on_head(
                 handle,
                 job_submit_cmd,
                 stream_logs=False,
                 require_outputs=True,
-                run_in_background=is_slurm)
+                run_in_background=False)
             # Happens when someone calls `sky exec` but remote is outdated for
             # running a job. Necessitating calling `sky launch`.
             backend_utils.check_stale_runtime_on_remote(returncode, stderr,
@@ -4272,13 +4287,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     f'Output: {output}')
                 _dump_code_to_file(codegen)
                 job_submit_cmd = f'{mkdir_code} && {code}'
-                # See comment above for why run_in_background=is_slurm.
                 returncode, stdout, stderr = self.run_on_head(
                     handle,
                     job_submit_cmd,
                     stream_logs=False,
                     require_outputs=True,
-                    run_in_background=is_slurm)
+                    run_in_background=False)
 
             subprocess_utils.handle_returncode(
                 returncode,
@@ -4297,7 +4311,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _add_job(self, handle: CloudVmRayResourceHandle,
                  job_name: Optional[str], resources_str: str,
                  metadata: str) -> Tuple[int, str]:
-        use_legacy = not handle.is_grpc_enabled_with_flag
+        is_slurm = isinstance(handle.launched_resources.cloud, clouds.Slurm)
+        # Slurm uses the retry-safe SSH transaction until its gRPC schema has
+        # the same stable submission identifier.
+        use_legacy = is_slurm or not handle.is_grpc_enabled_with_flag
 
         if not use_legacy:
             try:
@@ -4318,12 +4335,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 use_legacy = True
 
         if use_legacy:
+            submission_id = ((self._submission_id or self.run_timestamp)
+                             if is_slurm else None)
             code = job_lib.JobLibCodeGen.add_job(
                 job_name=job_name,
                 username=common_utils.get_user_hash(),
                 run_timestamp=self.run_timestamp,
                 resources_str=resources_str,
-                metadata=metadata)
+                metadata=metadata,
+                submission_id=submission_id)
             returncode, result_str, stderr = self.run_on_head(
                 handle,
                 code,
@@ -4507,18 +4527,35 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             logger.info(f'Dryrun complete. Would have run:\n{task}')
             return None
 
-        job_id, log_dir = self._add_job(handle, task_copy.name, resources_str,
-                                        task.metadata_json)
-
+        request_id = common_utils.get_current_request_id()
+        self._submission_id = (uuid.uuid4().hex if request_id
+                               == 'dummy-request-id' else request_id)
         num_actual_nodes = task.num_nodes * handle.num_ips_per_node
-        # Case: task_lib.Task(run, num_nodes=N) or TPU VM Pods
-        if num_actual_nodes > 1:
-            self._execute_task_n_nodes(handle, task_copy, job_id, log_dir)
-        else:
-            # Case: task_lib.Task(run, num_nodes=1)
-            self._execute_task_one_node(handle, task_copy, job_id, log_dir)
+        is_slurm = isinstance(handle.launched_resources.cloud, clouds.Slurm)
+        while True:
+            try:
+                job_id, log_dir = self._add_job(handle, task_copy.name,
+                                                resources_str,
+                                                task.metadata_json)
 
-        return job_id
+                # Case: task_lib.Task(run, num_nodes=N) or TPU VM Pods
+                if num_actual_nodes > 1:
+                    self._execute_task_n_nodes(handle, task_copy, job_id,
+                                               log_dir)
+                else:
+                    # Case: task_lib.Task(run, num_nodes=1)
+                    self._execute_task_one_node(handle, task_copy, job_id,
+                                                log_dir)
+                return job_id
+            except (exceptions.CommandError, exceptions.FetchClusterInfoError,
+                    ValueError) as e:
+                if not is_slurm or not _is_retryable_slurm_ssh_error(e):
+                    raise
+                logger.warning(
+                    'Lost SSH access to the Slurm login node while submitting '
+                    'the job. Retrying in '
+                    f'{_SLURM_SSH_RETRY_WAIT_SECONDS} seconds.')
+                time.sleep(_SLURM_SSH_RETRY_WAIT_SECONDS)
 
     def _post_execute(self, handle: CloudVmRayResourceHandle,
                       down: bool) -> None:
@@ -4759,16 +4796,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 use_legacy = True
 
         if use_legacy:
-            code = job_lib.JobLibCodeGen.cancel_jobs(jobs, cancel_all,
-                                                     user_hash)
-            returncode, stdout, _ = self.run_on_head(handle,
-                                                     code,
-                                                     stream_logs=False,
-                                                     require_outputs=True)
+            is_slurm = isinstance(handle.launched_resources.cloud, clouds.Slurm)
+            code = job_lib.JobLibCodeGen.cancel_jobs(jobs,
+                                                     cancel_all,
+                                                     user_hash,
+                                                     schedule=not is_slurm)
+            returncode, stdout, stderr = self.run_on_head(handle,
+                                                          code,
+                                                          stream_logs=False,
+                                                          require_outputs=True)
+            backend_utils.check_stale_runtime_on_remote(returncode, stderr,
+                                                        handle.cluster_name)
             subprocess_utils.handle_returncode(
                 returncode, code,
                 f'Failed to cancel jobs on cluster {handle.cluster_name}.',
-                stdout)
+                stdout + stderr)
             cancelled_ids = message_utils.decode_payload(stdout)
         if cancelled_ids:
             logger.info(

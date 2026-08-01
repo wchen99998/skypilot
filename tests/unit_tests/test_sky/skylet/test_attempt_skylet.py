@@ -77,6 +77,15 @@ class TestRunningCheck:
 
         assert attempt_skylet._find_running_skylet_pids() == [7680]
 
+    def test_managed_skylet_does_not_scan_other_allocations(
+            self, skylet_env, monkeypatch):
+        run = mock.Mock()
+        monkeypatch.setattr('subprocess.run', run)
+
+        assert attempt_skylet._find_running_skylet_pids(
+            use_legacy_fallback=False) == []
+        run.assert_not_called()
+
 
 class TestVersionMatch:
     """Test _check_version_match logic."""
@@ -228,3 +237,34 @@ class TestRestartSkylet:
         assert self.env['port_file'].read_text() == str(
             constants.SKYLET_GRPC_PORT)
         assert self.env['version_file'].read_text() == constants.SKYLET_VERSION
+
+    def test_foreground_process_is_tracked_and_waited(self, monkeypatch):
+        """Foreground mode keeps the owning Slurm step alive."""
+        monkeypatch.setattr(attempt_skylet, '_stop_skylet', mock.Mock())
+        monkeypatch.setattr('sky.utils.common_utils.find_free_port',
+                            lambda port: constants.SKYLET_GRPC_PORT)
+        process = mock.Mock(pid=12345)
+        popen = mock.Mock(return_value=process)
+        monkeypatch.setattr('subprocess.Popen', popen)
+
+        self.restart_skylet(foreground=True)
+
+        assert popen.call_args.args[0].startswith('exec ')
+        assert self.env['pid_file'].read_text() == '12345'
+        assert self.env['port_file'].read_text() == str(
+            constants.SKYLET_GRPC_PORT)
+        process.wait.assert_called_once_with()
+
+
+def test_stop_if_stale_stops_stale_skylet(monkeypatch):
+    monkeypatch.setattr('sys.argv', ['attempt_skylet', '--stop-if-stale'])
+    monkeypatch.setattr(attempt_skylet, '_find_running_skylet_pids',
+                        lambda **_: [12345])
+    monkeypatch.setattr(attempt_skylet, '_check_version_match', lambda:
+                        (False, 'old'))
+    stop = mock.Mock()
+    monkeypatch.setattr(attempt_skylet, '_stop_skylet', stop)
+
+    attempt_skylet.main()
+
+    stop.assert_called_once_with(use_legacy_fallback=False)

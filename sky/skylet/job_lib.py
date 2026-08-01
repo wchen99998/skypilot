@@ -40,10 +40,10 @@ else:
 logger = sky_logging.init_logger(__name__)
 
 _JOB_STATUS_LOCK = '~/.sky/locks/.job_{}.lock'
-# JOB_CMD_IDENTIFIER is used for identifying the process retrieved
-# with pid is the same driver process to guard against the case where
-# the same pid is reused by a different process.
-JOB_CMD_IDENTIFIER = 'echo "SKYPILOT_JOB_ID <{}>"'
+# JOB_CMD_IDENTIFIER is kept in the driver's argv so a reused pid cannot be
+# mistaken for the job driver.
+JOB_CMD_IDENTIFIER = 'SKYPILOT_JOB_ID <{}>'
+_SLURM_SCHEDULER_MIGRATION = 'slurm_allocation_scheduler_v43'
 
 
 def _get_lock_path(job_id: int) -> str:
@@ -113,6 +113,15 @@ def create_table(cursor, conn):
         created_time INTEGER
     )""")
 
+    cursor.execute("""CREATE TABLE IF NOT EXISTS job_submissions(
+        submission_id TEXT PRIMARY KEY,
+        job_id INTEGER
+    )""")
+
+    cursor.execute("""CREATE TABLE IF NOT EXISTS schema_migrations(
+        name TEXT PRIMARY KEY
+    )""")
+
     db_utils.add_column_to_table(cursor, conn, 'jobs', 'end_at', 'FLOAT')
     db_utils.add_column_to_table(cursor, conn, 'jobs', 'resources', 'TEXT')
     db_utils.add_column_to_table(cursor, conn, 'jobs', 'pid',
@@ -127,7 +136,61 @@ def create_table(cursor, conn):
                                  value_to_replace_existing_entries='{}')
     db_utils.add_column_to_table(cursor, conn, 'jobs', 'exit_codes',
                                  'TEXT DEFAULT NULL')
-    conn.commit()
+
+    # A driver loaded from a pre-v43 runtime can still call its old
+    # schedule_step() after an in-place upgrade. Capture those jobs atomically
+    # so new submissions wait until no legacy driver can launch work.
+    # TODO(wuhao): Remove with pre-v43 Skylet support.
+    with conn:
+        cursor.execute('BEGIN IMMEDIATE')
+        cursor.execute("""CREATE TABLE IF NOT EXISTS legacy_scheduler_jobs(
+            job_id INTEGER PRIMARY KEY,
+            pid INTEGER,
+            pid_create_time FLOAT
+        )""")
+        columns = {
+            row[1] for row in cursor.execute(
+                'PRAGMA table_info(legacy_scheduler_jobs)')
+        }
+        if 'pid' not in columns:
+            cursor.execute(
+                'ALTER TABLE legacy_scheduler_jobs ADD COLUMN pid INTEGER')
+        if 'pid_create_time' not in columns:
+            cursor.execute('ALTER TABLE legacy_scheduler_jobs '
+                           'ADD COLUMN pid_create_time FLOAT')
+        migrated = cursor.execute(
+            'SELECT 1 FROM schema_migrations WHERE name=(?)',
+            (_SLURM_SCHEDULER_MIGRATION,)).fetchone()
+        if migrated is None:
+            cursor.execute(
+                'INSERT OR IGNORE INTO legacy_scheduler_jobs(job_id) '
+                'SELECT job_id FROM jobs WHERE status IN (?, ?, ?)',
+                ('PENDING', 'SETTING_UP', 'RUNNING'))
+            terminal_jobs = cursor.execute(
+                'SELECT job_id, pid FROM jobs WHERE pid > 0 '
+                'AND status NOT IN (?, ?, ?)',
+                ('PENDING', 'SETTING_UP', 'RUNNING')).fetchall()
+            for legacy_job_id, legacy_pid in terminal_jobs:
+                pid_create_time = _get_process_create_time(legacy_pid)
+                if (pid_create_time is not None and
+                        _is_legacy_job_driver_process_running(
+                            legacy_pid, legacy_job_id, pid_create_time)):
+                    cursor.execute(
+                        'INSERT OR REPLACE INTO legacy_scheduler_jobs '
+                        'VALUES (?, ?, ?)',
+                        (legacy_job_id, legacy_pid, pid_create_time))
+            cursor.execute('UPDATE legacy_scheduler_jobs SET pid=('
+                           'SELECT jobs.pid FROM jobs '
+                           'WHERE jobs.job_id=legacy_scheduler_jobs.job_id)')
+            legacy_pids = cursor.execute(
+                'SELECT job_id, pid FROM legacy_scheduler_jobs').fetchall()
+            for legacy_job_id, legacy_pid in legacy_pids:
+                cursor.execute(
+                    'UPDATE legacy_scheduler_jobs SET pid_create_time=(?) '
+                    'WHERE job_id=(?)',
+                    (_get_process_create_time(legacy_pid), legacy_job_id))
+            cursor.execute('INSERT INTO schema_migrations VALUES (?)',
+                           (_SLURM_SCHEDULER_MIGRATION,))
 
 
 _DB = None
@@ -275,17 +338,75 @@ _INIT_SUBMIT_GRACE_PERIOD = 60
 _PRE_RESOURCE_STATUSES = [JobStatus.PENDING]
 
 
+@init_db
+def claim_job(job_id: int, pid: int) -> bool:
+    """Atomically let one launched claimant become the job driver."""
+    assert _DB is not None
+    with filelock.FileLock(_get_lock_path(job_id)):
+        row = _DB.cursor.execute(
+            'SELECT pending_jobs.submit, jobs.status '
+            'FROM pending_jobs JOIN jobs USING (job_id) '
+            'WHERE job_id=(?)', (job_id,)).fetchone()
+        if (row is None or row[0] != -1 or row[1] != JobStatus.PENDING.value):
+            return False
+        _DB.cursor.execute('UPDATE pending_jobs SET submit=-2 WHERE job_id=(?)',
+                           (job_id,))
+        _DB.cursor.execute('UPDATE jobs SET pid=(?) WHERE job_id=(?)',
+                           (pid, job_id))
+        _DB.conn.commit()
+        return True
+
+
+@init_db
+def mark_job_driver_started(job_id: int) -> None:
+    """Mark a claimed job only after its Python driver has started."""
+    assert _DB is not None
+    with filelock.FileLock(_get_lock_path(job_id)):
+        row = _DB.cursor.execute(
+            'SELECT submit FROM pending_jobs WHERE job_id=(?)',
+            (job_id,)).fetchone()
+        if row is None or row[0] != -2:
+            return
+        _DB.cursor.execute(
+            'UPDATE pending_jobs SET submit=(?) WHERE job_id=(?)',
+            (int(time.time()), job_id))
+        _DB.conn.commit()
+
+
 class JobScheduler:
     """Base class for job scheduler"""
 
     @init_db
-    def queue(self, job_id: int, cmd: str) -> None:
+    def queue(self, job_id: int, cmd: str, schedule: bool = True) -> None:
         assert _DB is not None
-        _DB.cursor.execute('INSERT INTO pending_jobs VALUES (?,?,?,?)',
-                           (job_id, cmd, 0, int(time.time())))
-        _DB.conn.commit()
-        set_status(job_id, JobStatus.PENDING)
-        self.schedule_step()
+        # QueueJob may be replayed when its SSH/gRPC response is lost. Claim
+        # INIT exactly once so a replay cannot reset or relaunch a running job.
+        with filelock.FileLock(_get_lock_path(job_id)):
+            status = get_status_no_lock(job_id)
+            if status == JobStatus.FAILED_DRIVER:
+                pending_job = _get_pending_job(job_id)
+                pid = _DB.cursor.execute(
+                    'SELECT pid FROM jobs WHERE job_id=(?)',
+                    (job_id,)).fetchone()[0]
+                if pid == 0 and pending_job is None:
+                    # AddJob reached the Skylet, but QueueJob did not. Revive
+                    # the stable reservation in the durable queue phase.
+                    _DB.cursor.execute(
+                        'UPDATE jobs SET status=(?), submitted_at=(?), '
+                        'end_at=NULL WHERE job_id=(?)',
+                        (JobStatus.INIT.value, time.time(), job_id))
+                    status = JobStatus.INIT
+            if status not in (JobStatus.INIT, JobStatus.PENDING):
+                return
+            if status == JobStatus.INIT:
+                pending_job = _get_pending_job(job_id)
+                if pending_job is None:
+                    _DB.cursor.execute(
+                        'INSERT INTO pending_jobs VALUES (?,?,?,?)',
+                        (job_id, cmd, 0, int(time.time())))
+                _set_status_no_lock(job_id, JobStatus.PENDING)
+        if schedule:
+            self.schedule_step()
 
     @init_db
     def remove_job_no_lock(self, job_id: int) -> None:
@@ -296,17 +417,26 @@ class JobScheduler:
     @init_db
     def _run_job(self, job_id: int, run_cmd: str):
         assert _DB is not None
-        _DB.cursor.execute(
-            (f'UPDATE pending_jobs SET submit={int(time.time())} '
-             f'WHERE job_id={job_id!r}'))
-        _DB.conn.commit()
-        pid = subprocess_utils.launch_new_process_tree(run_cmd)
-
-        _DB.cursor.execute((f'UPDATE jobs SET pid={pid} '
-                            f'WHERE job_id={job_id!r}'))
+        claim_code = (
+            'import os; '
+            'from sky.skylet import job_lib; '
+            f'claimed = job_lib.claim_job({job_id!r}, os.getpid()); '
+            f'os.environ.pop({constants.SLURM_SKYLET_OWNER_ENV_VAR!r}, None); '
+            f'os.execl("/bin/bash", "bash", "-c", {run_cmd!r}) '
+            'if claimed else None')
+        claim_cmd = (f'exec {constants.SKY_PYTHON_CMD} '
+                     f'-c {shlex.quote(claim_code)}')
+        pid = subprocess_utils.launch_new_process_tree(claim_cmd)
+        _DB.cursor.execute('UPDATE pending_jobs SET submit=-1 WHERE job_id=(?)',
+                           (job_id,))
+        _DB.cursor.execute('UPDATE jobs SET pid=(?) WHERE job_id=(?)',
+                           (pid, job_id))
         _DB.conn.commit()
 
     def schedule_step(self, force_update_jobs: bool = False) -> None:
+        if (os.environ.get('SLURM_JOB_ID') and
+                os.environ.get(constants.SLURM_SKYLET_OWNER_ENV_VAR) != '1'):
+            return
         if force_update_jobs:
             update_status()
         pending_job_ids = self._get_pending_job_ids()
@@ -326,8 +456,8 @@ class JobScheduler:
                 # We don't have to refresh the job status before checking, as
                 # the job status will only be stale in rare cases where ray job
                 # crashes; or the job stays in INIT state for a long time.
-                # In those cases, the periodic JobSchedulerEvent event will
-                # update the job status every 300 seconds.
+                # In those cases, the periodic JobSchedulerEvent will update
+                # the job status.
                 status = get_status_no_lock(job_id)
                 if (status not in _PRE_RESOURCE_STATUSES or
                         created_time < psutil.boot_time()):
@@ -336,6 +466,19 @@ class JobScheduler:
                     self.remove_job_no_lock(job_id)
                     continue
                 if submit:
+                    if submit < 0:
+                        pid = _DB.cursor.execute(
+                            'SELECT pid FROM jobs WHERE job_id=(?)',
+                            (job_id,)).fetchone()[0]
+                        if not _is_job_driver_process_running(pid, job_id):
+                            _DB.cursor.execute(
+                                'UPDATE pending_jobs SET submit=0 '
+                                'WHERE job_id=(?)', (job_id,))
+                            _DB.cursor.execute(
+                                'UPDATE jobs SET pid=0 WHERE job_id=(?)',
+                                (job_id,))
+                            _DB.conn.commit()
+                            self._run_job(job_id, run_cmd)
                     # Next job waiting for resources
                     return
                 self._run_job(job_id, run_cmd)
@@ -386,29 +529,73 @@ def add_job(job_name: str,
             username: str,
             run_timestamp: str,
             resources_str: str,
-            metadata: str = '{}') -> Tuple[int, str]:
-    """Atomically reserve the next available job id for the user."""
+            metadata: str = '{}',
+            submission_id: Optional[str] = None) -> Tuple[int, str]:
+    """Atomically get or reserve the job id for a submission."""
     assert _DB is not None
-    job_submitted_at = time.time()
-    # job_id will autoincrement with the null value
-    if int(constants.SKYLET_VERSION) >= 28:
-        _DB.cursor.execute(
-            'INSERT INTO jobs VALUES (null, ?, ?, ?, ?, ?, ?, null, ?, 0, null, ?, null)',  # pylint: disable=line-too-long
-            (job_name, username, job_submitted_at, JobStatus.INIT.value,
-             run_timestamp, None, resources_str, metadata))
-    else:
-        _DB.cursor.execute(
-            'INSERT INTO jobs VALUES (null, ?, ?, ?, ?, ?, ?, null, ?, 0, null, ?)',  # pylint: disable=line-too-long
-            (job_name, username, job_submitted_at, JobStatus.INIT.value,
-             run_timestamp, None, resources_str, metadata))
-    _DB.conn.commit()
-    rows = _DB.cursor.execute('SELECT job_id FROM jobs WHERE run_timestamp=(?)',
-                              (run_timestamp,))
-    for row in rows:
-        job_id = row[0]
-    assert job_id is not None
-    log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY, f'{job_id}-{job_name}')
-    set_log_dir_no_lock(job_id, log_dir)
+    # The API request ID survives worker restarts. Callers without a stable
+    # submission ID keep the original insert-on-every-call behavior.
+    has_explicit_submission_id = submission_id is not None
+    with _DB.conn:
+        _DB.cursor.execute('BEGIN IMMEDIATE')
+        if has_explicit_submission_id:
+            legacy_jobs = _DB.cursor.execute(
+                'SELECT legacy.job_id, legacy.pid, legacy.pid_create_time, '
+                'jobs.pid, jobs.status FROM legacy_scheduler_jobs AS legacy '
+                'JOIN jobs USING (job_id)').fetchall()
+            for (legacy_job_id, captured_pid, captured_pid_create_time,
+                 current_pid, legacy_status) in legacy_jobs:
+                if current_pid != captured_pid:
+                    captured_pid_create_time = _get_process_create_time(
+                        current_pid)
+                    _DB.cursor.execute(
+                        'UPDATE legacy_scheduler_jobs '
+                        'SET pid=(?), pid_create_time=(?) WHERE job_id=(?)',
+                        (current_pid, captured_pid_create_time, legacy_job_id))
+                if (not JobStatus(legacy_status).is_terminal() or
+                        _is_legacy_job_driver_process_running(
+                            current_pid, legacy_job_id,
+                            captured_pid_create_time)):
+                    raise RuntimeError(
+                        'Existing jobs from the pre-v43 Slurm runtime must '
+                        'finish before another job can be submitted safely.')
+        row = None
+        if has_explicit_submission_id:
+            row = _DB.cursor.execute(
+                'SELECT jobs.job_id, jobs.log_dir, jobs.status, jobs.pid '
+                'FROM job_submissions JOIN jobs USING (job_id) '
+                'WHERE submission_id=(?)', (submission_id,)).fetchone()
+        if row is None:
+            job_submitted_at = time.time()
+            # job_id will autoincrement with the null value.
+            if int(constants.SKYLET_VERSION) >= 28:
+                _DB.cursor.execute(
+                    'INSERT INTO jobs VALUES (null, ?, ?, ?, ?, ?, ?, null, ?, 0, null, ?, null)',  # pylint: disable=line-too-long
+                    (job_name, username, job_submitted_at, JobStatus.INIT.value,
+                     run_timestamp, None, resources_str, metadata))
+            else:
+                _DB.cursor.execute(
+                    'INSERT INTO jobs VALUES (null, ?, ?, ?, ?, ?, ?, null, ?, 0, null, ?)',  # pylint: disable=line-too-long
+                    (job_name, username, job_submitted_at, JobStatus.INIT.value,
+                     run_timestamp, None, resources_str, metadata))
+            job_id = _DB.cursor.lastrowid
+            assert job_id is not None
+            log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY,
+                                   f'{job_id}-{job_name}')
+            _DB.cursor.execute('UPDATE jobs SET log_dir=(?) WHERE job_id=(?)',
+                               (log_dir, job_id))
+        else:
+            job_id, log_dir, _, _ = row
+            if log_dir is None:
+                log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY,
+                                       f'{job_id}-{job_name}')
+                _DB.cursor.execute(
+                    'UPDATE jobs SET log_dir=(?) WHERE job_id=(?)',
+                    (log_dir, job_id))
+        if has_explicit_submission_id:
+            _DB.cursor.execute(
+                'INSERT OR REPLACE INTO job_submissions VALUES (?, ?)',
+                (submission_id, job_id))
     return job_id, log_dir
 
 
@@ -847,6 +1034,35 @@ def _is_job_driver_process_running(job_pid: int, job_id: int) -> bool:
         return False
 
 
+def _get_process_create_time(pid: Optional[int]) -> Optional[float]:
+    if pid is None or pid <= 0:
+        return None
+    try:
+        process = psutil.Process(pid)
+        return process.create_time() if process.is_running() else None
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return None
+
+
+def _is_legacy_job_driver_process_running(
+        pid: Optional[int], job_id: int,
+        expected_create_time: Optional[float]) -> bool:
+    """Check a captured legacy PID using its script path and process identity."""
+    create_time = _get_process_create_time(pid)
+    if (create_time is None or (expected_create_time is not None and
+                                create_time != expected_create_time)):
+        return False
+    assert pid is not None
+    try:
+        cmdline = psutil.Process(pid).cmdline()
+        marker = JOB_CMD_IDENTIFIER.format(job_id)
+        script_name = f'sky_job_{job_id}'
+        return (any(marker in arg for arg in cmdline) or
+                any(os.path.basename(arg) == script_name for arg in cmdline))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+
+
 def update_job_status(job_ids: List[int],
                       silent: bool = False) -> List[JobStatus]:
     """Updates and returns the job statuses matching our `JobStatus` semantics.
@@ -1072,7 +1288,8 @@ def _make_ray_job_id(sky_job_id: int) -> str:
 
 def cancel_jobs_encoded_results(jobs: Optional[List[int]],
                                 cancel_all: bool = False,
-                                user_hash: Optional[str] = None) -> str:
+                                user_hash: Optional[str] = None,
+                                schedule: bool = True) -> str:
     """Cancel jobs.
 
     Args:
@@ -1080,20 +1297,25 @@ def cancel_jobs_encoded_results(jobs: Optional[List[int]],
         cancel_all: Whether to cancel all jobs.
         user_hash: If specified, cancels the jobs for the specified user only.
             Otherwise, applies to all users.
+        schedule: Whether this caller may launch the next pending job.
 
     Returns:
         Encoded job IDs that are actually cancelled. Caller should use
         message_utils.decode_payload() to parse.
     """
-    return message_utils.encode_payload(cancel_jobs(jobs, cancel_all,
-                                                    user_hash))
+    return message_utils.encode_payload(
+        cancel_jobs(jobs, cancel_all, user_hash, schedule))
 
 
 def cancel_jobs(jobs: Optional[List[int]],
                 cancel_all: bool = False,
-                user_hash: Optional[str] = None) -> List[int]:
+                user_hash: Optional[str] = None,
+                schedule: bool = True) -> List[int]:
     job_records = []
-    all_status = [JobStatus.PENDING, JobStatus.SETTING_UP, JobStatus.RUNNING]
+    all_status = [
+        JobStatus.INIT, JobStatus.PENDING, JobStatus.SETTING_UP,
+        JobStatus.RUNNING
+    ]
     if jobs is None and not cancel_all:
         # Cancel the latest (largest job ID) running job from current user.
         job_records = _get_jobs(user_hash, [JobStatus.RUNNING])[:1]
@@ -1137,12 +1359,14 @@ def cancel_jobs(jobs: Optional[List[int]],
             # Get the job status again to avoid race condition.
             job_status = get_status_no_lock(job['job_id'])
             if job_status in [
-                    JobStatus.PENDING, JobStatus.SETTING_UP, JobStatus.RUNNING
+                    JobStatus.INIT, JobStatus.PENDING, JobStatus.SETTING_UP,
+                    JobStatus.RUNNING
             ]:
                 _set_status_no_lock(job['job_id'], JobStatus.CANCELLED)
                 cancelled_ids.append(job['job_id'])
 
-        scheduler.schedule_step()
+        if schedule:
+            scheduler.schedule_step()
     return cancelled_ids
 
 
@@ -1211,38 +1435,59 @@ class JobLibCodeGen:
     ]
 
     @classmethod
-    def add_job(cls, job_name: Optional[str], username: str, run_timestamp: str,
-                resources_str: str, metadata: str) -> str:
+    def add_job(cls,
+                job_name: Optional[str],
+                username: str,
+                run_timestamp: str,
+                resources_str: str,
+                metadata: str,
+                submission_id: Optional[str] = None) -> str:
         if job_name is None:
             job_name = '-'
         code = [
-            # We disallow job submission when SKYLET_VERSION is older than 9, as
-            # it was using ray job submit before #4318, and switched to raw
+            # We disallow job submission when SKYLET_VERSION is older than 9,
+            # as it was using ray job submit before #4318, and switched to raw
             # process. Using the old skylet version will cause the job status
-            # to be stuck in PENDING state or transition to FAILED_DRIVER state.
+            # to be stuck in PENDING state or transition to FAILED_DRIVER.
             '\nif int(constants.SKYLET_VERSION) < 9: '
             'raise RuntimeError("SkyPilot runtime is too old, which does not '
             'support submitting jobs.")',
             '\nresult = None',
-            '\nif int(constants.SKYLET_VERSION) < 15: '
-            '\n result = job_lib.add_job('
-            f'{job_name!r},'
-            f'{username!r},'
-            f'{run_timestamp!r},'
-            f'{resources_str!r})',
-            '\nelse: '
-            '\n result = job_lib.add_job('
-            f'{job_name!r},'
-            f'{username!r},'
-            f'{run_timestamp!r},'
-            f'{resources_str!r},'
-            f'metadata={metadata!r})',
-            ('\nif isinstance(result, tuple):'
-             '\n  print("Job ID: " + str(result[0]), flush=True)'
-             '\n  print("Log Dir: " + str(result[1]), flush=True)'
-             '\nelse:'
-             '\n  print("Job ID: " + str(result), flush=True)'),
         ]
+        if submission_id is not None:
+            code.extend([
+                '\nif int(constants.SKYLET_VERSION) < 43: '
+                'raise RuntimeError("SkyPilot runtime is too old for '
+                'retry-safe job submission. Run sky launch to upgrade it.")',
+                '\nresult = job_lib.add_job('
+                f'{job_name!r},'
+                f'{username!r},'
+                f'{run_timestamp!r},'
+                f'{resources_str!r},'
+                f'metadata={metadata!r},'
+                f'submission_id={submission_id!r})',
+            ])
+        else:
+            code.extend([
+                '\nif int(constants.SKYLET_VERSION) < 15: '
+                '\n result = job_lib.add_job('
+                f'{job_name!r},'
+                f'{username!r},'
+                f'{run_timestamp!r},'
+                f'{resources_str!r})',
+                '\nelse: '
+                '\n result = job_lib.add_job('
+                f'{job_name!r},'
+                f'{username!r},'
+                f'{run_timestamp!r},'
+                f'{resources_str!r},'
+                f'metadata={metadata!r})',
+            ])
+        code.append(('\nif isinstance(result, tuple):'
+                     '\n  print("Job ID: " + str(result[0]), flush=True)'
+                     '\n  print("Log Dir: " + str(result[1]), flush=True)'
+                     '\nelse:'
+                     '\n  print("Job ID: " + str(result), flush=True)'))
         return cls._build(code)
 
     @classmethod
@@ -1324,12 +1569,16 @@ class JobLibCodeGen:
         return cls._build(code)
 
     @classmethod
-    def queue_job(cls, job_id: int, cmd: str) -> str:
-        code = [
-            'job_lib.scheduler.queue('
-            f'{job_id!r},'
-            f'{cmd!r})',
-        ]
+    def queue_job(cls, job_id: int, cmd: str, schedule: bool = True) -> str:
+        if schedule:
+            code = [f'job_lib.scheduler.queue({job_id!r},{cmd!r})']
+        else:
+            code = [
+                '\nif int(constants.SKYLET_VERSION) < 43: '
+                'raise RuntimeError("SkyPilot runtime is too old for '
+                'allocation-owned job launch. Run sky launch to upgrade it.")',
+                f'\njob_lib.scheduler.queue({job_id!r},{cmd!r},schedule=False)',
+            ]
         return cls._build(code)
 
     @classmethod
@@ -1360,17 +1609,29 @@ class JobLibCodeGen:
     def cancel_jobs(cls,
                     job_ids: Optional[List[int]],
                     cancel_all: bool = False,
-                    user_hash: Optional[str] = None) -> str:
+                    user_hash: Optional[str] = None,
+                    schedule: bool = True) -> str:
         """See job_lib.cancel_jobs()."""
-        code = [
-            (f'cancelled = job_lib.cancel_jobs_encoded_results('
-             f'jobs={job_ids!r}, cancel_all={cancel_all}, '
-             f'user_hash={user_hash!r})'),
-            # Print cancelled IDs. Caller should parse by decoding.
-            'print(cancelled, flush=True)',
-        ]
+        if schedule:
+            code = [
+                (f'cancelled = job_lib.cancel_jobs_encoded_results('
+                 f'jobs={job_ids!r}, cancel_all={cancel_all}, '
+                 f'user_hash={user_hash!r})'),
+                # Print cancelled IDs. Caller should parse by decoding.
+                'print(cancelled, flush=True)',
+            ]
+        else:
+            code = [
+                '\nif int(constants.SKYLET_VERSION) < 43: '
+                'raise RuntimeError("SkyPilot runtime is too old for '
+                'allocation-owned job launch. Run sky launch to upgrade it.")',
+                (f'\ncancelled = job_lib.cancel_jobs_encoded_results('
+                 f'jobs={job_ids!r}, cancel_all={cancel_all}, '
+                 f'user_hash={user_hash!r}, schedule=False)'),
+                '\nprint(cancelled, flush=True)',
+            ]
         # TODO(zhwu): Backward compatibility, remove after 0.12.0.
-        if user_hash is None:
+        if user_hash is None and schedule:
             code = [
                 (f'cancelled = job_lib.cancel_jobs_encoded_results('
                  f' {job_ids!r}, {cancel_all})'),

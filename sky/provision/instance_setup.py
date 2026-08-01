@@ -160,6 +160,31 @@ MAYBE_SKYLET_RESTART_CMD = (f'{constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV}; '
                             f'{constants.SKY_PYTHON_CMD} -m '
                             'sky.skylet.attempt_skylet;')
 
+_SLURM_SKYLET_START_FILE = '$HOME/.sky/skylet_start.sh'
+_SLURM_SKYLET_SERVICE_MARKER = (
+    f'{constants.SKY_RUNTIME_DIR}/.sky/skylet_service')
+_SLURM_SKYLET_PID_FILE = (
+    f'{constants.SKY_RUNTIME_DIR}/{constants.SKYLET_PID_FILE}')
+_SLURM_SKYLET_VERSION_FILE = (
+    f'{constants.SKY_RUNTIME_DIR}/{constants.SKYLET_VERSION_FILE}')
+SLURM_SKYLET_WAIT_CMD = (
+    f'if [ ! -f "{_SLURM_SKYLET_SERVICE_MARKER}" ]; then '
+    'echo "This Slurm allocation predates the allocation-owned Skylet; '
+    'relaunch the cluster." >&2; '
+    'exit 1; '
+    'fi; '
+    f'{constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV}; '
+    f'{constants.SKY_PYTHON_CMD} -m sky.skylet.attempt_skylet '
+    '--stop-if-stale; '
+    'for _ in {1..30}; do '
+    f'if [ -s {_SLURM_SKYLET_PID_FILE} ] && '
+    f'kill -0 "$(cat {_SLURM_SKYLET_PID_FILE})" 2>/dev/null && '
+    f'[ "$(cat {_SLURM_SKYLET_VERSION_FILE} 2>/dev/null)" = '
+    f'"{constants.SKYLET_VERSION}" ]; then exit 0; fi; '
+    'sleep 1; '
+    'done; '
+    'exit 1;')
+
 
 def _set_usage_run_id_cmd() -> str:
     """Gets the command to set the usage run id.
@@ -674,13 +699,29 @@ def start_skylet_on_head_node(
     # info, other options, and cluster identity / accelerator context for
     # skylet's heartbeat event.
     set_skypilot_env_var_cmd = _set_skypilot_env_var_cmd()
-    returncode, stdout, stderr = head_runner.run(
-        f'{set_usage_run_id_cmd}; {set_skypilot_env_var_cmd}; '
-        f'{MAYBE_SKYLET_RESTART_CMD}',
-        stream_logs=False,
-        require_outputs=True,
-        log_path=log_path_abs,
-        source_bashrc=True)
+    cmd = (f'{set_usage_run_id_cmd}; {set_skypilot_env_var_cmd}; '
+           f'{MAYBE_SKYLET_RESTART_CMD}')
+    run = head_runner.run
+    if cluster_info.provider_name == 'slurm':
+        service_cmd = (
+            f'set -e; {set_usage_run_id_cmd}; {set_skypilot_env_var_cmd}; '
+            f'export {constants.SLURM_SKYLET_OWNER_ENV_VAR}=1; '
+            f'{constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV}; '
+            f'exec {constants.SKY_PYTHON_CMD} -m '
+            'sky.skylet.attempt_skylet --foreground')
+        cmd = (f'skylet_start_tmp="{_SLURM_SKYLET_START_FILE}.tmp.$$"; '
+               f'printf "export PATH=%q\\n%s\\n" "$PATH" '
+               f'{shlex.quote(service_cmd)} > '
+               f'"$skylet_start_tmp" && '
+               f'mv "$skylet_start_tmp" "{_SLURM_SKYLET_START_FILE}" && '
+               f'{SLURM_SKYLET_WAIT_CMD}')
+        run = head_runner.run_driver
+
+    returncode, stdout, stderr = run(cmd,
+                                     stream_logs=False,
+                                     require_outputs=True,
+                                     log_path=log_path_abs,
+                                     source_bashrc=True)
     if returncode:
         raise RuntimeError('Failed to start skylet on the head node '
                            f'(exit code {returncode}). Error: '

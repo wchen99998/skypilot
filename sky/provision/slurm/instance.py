@@ -510,11 +510,24 @@ def _create_virtual_instance(
     provision_scripts_dir = os.path.dirname(provision_script_path)
 
     skypilot_runtime_dir = _skypilot_runtime_dir(tmpdir, cluster_name_on_cloud)
+    runtime_parent = os.path.normpath(tmpdir if tmpdir is not None else '/tmp')
+    skypilot_runtime_dir = os.path.normpath(skypilot_runtime_dir)
+    if (not os.path.isabs(skypilot_runtime_dir) or
+            os.path.dirname(skypilot_runtime_dir) != runtime_parent or
+            os.path.basename(skypilot_runtime_dir) != cluster_name_on_cloud):
+        raise ValueError(
+            f'Unsafe SkyPilot runtime directory: {skypilot_runtime_dir!r}')
+    quoted_runtime_dir = shlex.quote(skypilot_runtime_dir)
     sky_cluster_home_dir = _sky_cluster_home_dir(sky_base_dir,
                                                  cluster_name_on_cloud)
-    ready_signal = f'{sky_cluster_home_dir}/.sky_sbatch_ready'
+    ready_signal_base = f'{sky_cluster_home_dir}/.sky_sbatch_ready'
+    # Include the allocation ID so an uncleanly terminated allocation cannot
+    # make its replacement appear ready.
+    ready_signal = f'{ready_signal_base}_$SLURM_JOB_ID'
     slurm_marker_file = (
         f'{sky_cluster_home_dir}/{slurm_utils.SLURM_MARKER_FILE}')
+    skylet_start_file = f'{sky_cluster_home_dir}/.sky/skylet_start.sh'
+    skylet_service_marker = (f'{skypilot_runtime_dir}/.sky/skylet_service')
 
     # For non-Docker Hub registries, pyxis/enroot requires '#' separator
     # between registry and path. See:
@@ -633,6 +646,35 @@ echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
             f'echo "[container] Ready in $((SECONDS - CONTAINER_START))s"\n'
             f'touch {container_marker_file} {ready_signal}')
 
+    skylet_service_script = shlex.quote(f"""\
+export {skylet_constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}={shlex.quote(skypilot_runtime_dir)}
+cd {shlex.quote(sky_cluster_home_dir)}
+export HOME="$PWD"
+mkdir -p {shlex.quote(os.path.dirname(skylet_service_marker))}
+touch {shlex.quote(skylet_service_marker)}
+while [ ! -s {shlex.quote(skylet_start_file)} ]; do sleep 1; done
+while true; do
+    bash {shlex.quote(skylet_start_file)}
+    sleep 1
+done
+""")
+    skylet_service_block = (
+        f'rm -f {shlex.quote(skylet_start_file)} '
+        f'{shlex.quote(skylet_service_marker)}\n'
+        f'SKYLET_START=$SECONDS\n'
+        f'echo "[skylet] Starting service on $SLURMD_NODENAME"\n'
+        f'bash -c {skylet_service_script} &\n'
+        f'SKYLET_SERVICE_PID=$!\n'
+        f'while [ ! -f {shlex.quote(skylet_service_marker)} ]; do\n'
+        f'  if ! kill -0 "$SKYLET_SERVICE_PID" 2>/dev/null; then\n'
+        f'    echo "[skylet] ERROR: Service failed to start."\n'
+        f'    wait "$SKYLET_SERVICE_PID"\n'
+        f'    exit $?\n'
+        f'  fi\n'
+        f'  sleep 1\n'
+        f'done\n'
+        f'echo "[skylet] Service ready in $((SECONDS - SKYLET_START))s"')
+
     # By default stdout and stderr will be written to $HOME/slurm-%j.out
     # (because we invoke sbatch from $HOME). Redirect elsewhere to not pollute
     # the home directory.
@@ -661,11 +703,23 @@ echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
 # Cleanup function to remove cluster dirs on job termination.
 cleanup() {{
     saved_exit=$?
-    # The Skylet is daemonized, so it is not automatically terminated when
-    # the Slurm job is terminated, we need to kill it manually.
-    echo "Terminating Skylet..."
-    if [ -f "{skypilot_runtime_dir}/.sky/skylet_pid" ]; then
-        kill $(cat "{skypilot_runtime_dir}/.sky/skylet_pid") 2>/dev/null || true
+    echo "Terminating Skylet service..."
+    if [ -n "${{SKYLET_SERVICE_PID:-}}" ]; then
+        kill "$SKYLET_SERVICE_PID" 2>/dev/null || true
+    fi
+    if [ -s "{skypilot_runtime_dir}/{skylet_constants.SKYLET_PID_FILE}" ]; then
+        skylet_pid=$(cat "{skypilot_runtime_dir}/{skylet_constants.SKYLET_PID_FILE}")
+        if [ "$skylet_pid" -gt 0 ] 2>/dev/null && \
+                ps -p "$skylet_pid" -o args= | grep -q "sky.skylet.skylet"; then
+            kill "$skylet_pid" 2>/dev/null || true
+        fi
+    fi
+    if [ -n "${{SKYLET_SERVICE_PID:-}}" ]; then
+        wait "$SKYLET_SERVICE_PID" 2>/dev/null || true
+    fi
+    if [ -n "${{CONTAINER_PID:-}}" ]; then
+        kill "$CONTAINER_PID" 2>/dev/null || true
+        wait "$CONTAINER_PID" 2>/dev/null || true
     fi
     echo "Cleaning up sky directories..."
     # Remove the per-node enroot container, if it exists.
@@ -678,7 +732,7 @@ cleanup() {{
     # sbatch is the same number. Otherwise, there are no guarantees
     # that this srun will run on the same subset of nodes as the srun
     # that created the sky directories.
-    srun --nodes={num_nodes} rm -rf {skypilot_runtime_dir}
+    srun --nodes={num_nodes} --ntasks-per-node=1 rm -rf -- {quoted_runtime_dir}
     rm -rf {sky_cluster_home_dir}
     exit $saved_exit
 }}
@@ -690,17 +744,20 @@ trap 'exit 0' TERM
 
 # Create sky home directory and subdirectories for the cluster.
 mkdir -p {sky_cluster_home_dir}/sky_logs {sky_cluster_home_dir}/sky_workdir {sky_cluster_home_dir}/.sky
-# Create sky runtime directory on each node.
-srun --nodes={num_nodes} mkdir -p {skypilot_runtime_dir}
+# A new allocation must not inherit jobs, PIDs, or version files from a prior
+# allocation whose EXIT trap could not run (for example after SIGKILL).
+srun --nodes={num_nodes} --ntasks-per-node=1 rm -rf -- {quoted_runtime_dir}
+srun --nodes={num_nodes} --ntasks-per-node=1 mkdir -p -- {quoted_runtime_dir}
 # Marker file to indicate we're in a Slurm cluster.
 touch {slurm_marker_file}
 # Store proctrack type for task executor to read.
 echo '{proctrack_type or "unknown"}' > {sky_cluster_home_dir}/{skylet_constants.SLURM_PROCTRACK_TYPE_FILE}
 # Suppress login messages.
 touch {sky_cluster_home_dir}/.hushlogin
+{skylet_service_block}
 {container_block}
 {f'touch {ready_signal}' if container_image is None else ''}
-{'sleep infinity' if container_image is None else 'wait'}
+{'wait "$SKYLET_SERVICE_PID"' if container_image is None else 'wait -n'}
 """
     # fmt: on
     # pylint: enable=line-too-long
@@ -723,6 +780,7 @@ touch {sky_cluster_home_dir}/.hushlogin
         login_node_runner.rsync(src_path, tgt_path, up=True, stream_logs=False)
 
     job_id = client.submit_job(partition, cluster_name_on_cloud, tgt_path)
+    ready_signal = f'{ready_signal_base}_{job_id}'
     logger.debug(f'Successfully submitted Slurm job {job_id} to partition '
                  f'{partition} for cluster {cluster_name_on_cloud} '
                  f'with {num_nodes} nodes')

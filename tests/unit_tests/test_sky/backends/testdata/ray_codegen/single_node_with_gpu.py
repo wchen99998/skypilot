@@ -29,6 +29,8 @@ from sky.skylet import job_lib
 from sky.utils import log_utils
 from sky.utils import subprocess_utils
 
+if int(constants.SKYLET_VERSION) >= 43:
+    job_lib.mark_job_driver_started(2)
 SKY_REMOTE_WORKDIR = '~/sky_workdir'
 
 CANCELLED_RETURN_CODE = 137

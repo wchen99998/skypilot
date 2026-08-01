@@ -3,11 +3,13 @@
 import multiprocessing
 import socket
 import time
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
 
+from sky import clouds
 from sky import exceptions
 from sky import resources
 from sky import task
@@ -732,3 +734,126 @@ def test_compute_tpu_mig_scale_down_rejected_before_teardown():
 
     terminate_instances.assert_not_called()
     run_on_head.assert_not_called()
+
+
+def test_slurm_execute_retries_transient_submission_connection_failure():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.provision_runtime_metadata.run_started = False
+    handle.launched_resources.cloud = clouds.Slurm()
+    handle.num_ips_per_node = 1
+    test_task = task.Task(run='true')
+    valid_resource = resources.Resources()
+    connection_error = exceptions.CommandError(255, 'ssh isambard',
+                                               'Failed to submit job.',
+                                               'Connection reset by peer')
+    home_error = ValueError(
+        'Failed to get remote home directory: Connection reset by peer')
+    submission_ids = []
+
+    def add_job_side_effect(*args, **kwargs):
+        del args, kwargs
+        submission_ids.append(backend._submission_id)
+        return 1, '/tmp/logs'
+
+    with patch.object(
+            backend, 'check_resources_fit_cluster',
+            return_value=valid_resource), patch.object(
+                backend, '_add_job',
+                side_effect=add_job_side_effect) as add_job, patch.object(
+                    backend,
+                    '_execute_task_one_node',
+                    side_effect=[home_error, connection_error,
+                                 None]) as execute_task, patch.object(
+                                     cloud_vm_ray_backend.time,
+                                     'sleep') as sleep:
+        assert backend._execute(handle, test_task) == 1
+
+    assert add_job.call_count == 3
+    assert execute_task.call_count == 3
+    assert sleep.call_args_list == [call(60), call(60)]
+    assert len(set(submission_ids)) == 1
+
+
+def test_reused_backend_gets_fresh_local_submission_id():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.provision_runtime_metadata.run_started = False
+    handle.launched_resources.cloud = clouds.Slurm()
+    handle.num_ips_per_node = 1
+    test_task = task.Task(run='true')
+    valid_resource = resources.Resources()
+    submission_ids = []
+
+    def add_job_side_effect(*args, **kwargs):
+        del args, kwargs
+        submission_ids.append(backend._submission_id)
+        return len(submission_ids), '/tmp/logs'
+
+    with patch.object(cloud_vm_ray_backend.common_utils,
+                      'get_current_request_id',
+                      return_value='dummy-request-id'), patch.object(
+                          backend,
+                          'check_resources_fit_cluster',
+                          return_value=valid_resource), patch.object(
+                              backend,
+                              '_add_job',
+                              side_effect=add_job_side_effect), patch.object(
+                                  backend, '_execute_task_one_node'):
+        assert backend._execute(handle, test_task) == 1
+        assert backend._execute(handle, test_task) == 2
+
+    assert len(submission_ids) == 2
+    assert submission_ids[0] != submission_ids[1]
+
+
+def test_slurm_add_job_always_uses_submission_id():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.is_grpc_enabled_with_flag = True
+    handle.launched_resources.cloud = clouds.Slurm()
+
+    with patch.object(
+            cloud_vm_ray_backend.job_lib.JobLibCodeGen,
+            'add_job',
+            return_value='add-job-code') as add_job_codegen, patch.object(
+                backend,
+                'run_on_head',
+                return_value=(0, 'Job ID: 1\nLog Dir: /tmp/logs\n', '')):
+        assert backend._add_job(handle, 'train', '4xGH200',
+                                '{}') == (1, '/tmp/logs')
+
+    assert add_job_codegen.call_args.kwargs[
+        'submission_id'] == backend.run_timestamp
+
+
+def test_slurm_queue_is_synchronous_and_enqueue_only():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.is_grpc_enabled_with_flag = True
+    handle.launched_resources.cloud = clouds.Slurm()
+    handle.cluster_name = 'isambard'
+
+    with patch.object(
+            cloud_vm_ray_backend.job_lib.JobLibCodeGen,
+            'queue_job',
+            return_value='queue-code') as queue_job_codegen, patch.object(
+                cloud_vm_ray_backend.job_lib.JobLibCodeGen,
+                'wait_for_job') as wait_for_job, patch.object(
+                    cloud_vm_ray_backend.backend_utils,
+                    'is_command_length_over_limit',
+                    return_value=False), patch.object(
+                        cloud_vm_ray_backend.controller_utils.Controllers,
+                        'from_name',
+                        return_value=None), patch.object(
+                            backend, 'run_on_head',
+                            return_value=(0, '', '')) as run_on_head:
+        backend._exec_code_on_head(handle, 'print("train")', 1)
+
+    queue_job_codegen.assert_called_once()
+    assert queue_job_codegen.call_args.kwargs['schedule'] is False
+    queued_cmd = queue_job_codegen.call_args.args[1]
+    marker = cloud_vm_ray_backend.job_lib.JOB_CMD_IDENTIFIER.format(1)
+    assert queued_cmd.count(marker) == 2
+    wait_for_job.assert_not_called()
+    assert run_on_head.call_args.kwargs['run_in_background'] is False

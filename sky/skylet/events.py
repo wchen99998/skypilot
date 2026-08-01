@@ -30,6 +30,7 @@ from sky.utils import yaml_utils
 
 # Seconds of sleep between the processing of skylet events.
 EVENT_CHECKING_INTERVAL_SECONDS = 20
+_IS_SLURM_ALLOCATION = bool(os.environ.get('SLURM_JOB_ID'))
 logger = sky_logging.init_logger(__name__)
 
 
@@ -70,7 +71,12 @@ class SkyletEvent:
 
 class JobSchedulerEvent(SkyletEvent):
     """Skylet event for scheduling jobs"""
-    EVENT_INTERVAL_SECONDS = 300
+    EVENT_INTERVAL_SECONDS = (EVENT_CHECKING_INTERVAL_SECONDS
+                              if _IS_SLURM_ALLOCATION else 300)
+
+    def start(self):
+        if _IS_SLURM_ALLOCATION:
+            self._run()
 
     def _run(self):
         job_lib.scheduler.schedule_step(force_update_jobs=True)

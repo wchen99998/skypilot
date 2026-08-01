@@ -158,7 +158,7 @@ MANAGED_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}MANAGED_JOB_ID'
 # cluster yaml is updated.
 #
 # TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
-SKYLET_VERSION = '39'  # add external-link log-scan skylet event.
+SKYLET_VERSION = '43'  # Retry-safe allocation-owned Slurm job launch.
 # The version of the lib files that skylet/jobs use. Whenever there is an API
 # change for the job_lib or log_lib, we need to bump this version, so that the
 # user can be notified to update their SkyPilot version on the remote cluster.
@@ -757,6 +757,7 @@ X86_64_ARCH = 'x86_64'
 # Slurm marker file for proctrack type detection.
 # Used by the executor to conditionally apply multi-node barrier.
 SLURM_PROCTRACK_TYPE_FILE = '.sky_proctrack_type'
+SLURM_SKYLET_OWNER_ENV_VAR = (f'{SKYPILOT_ENV_VAR_PREFIX}SLURM_SKYLET_OWNER')
 
 SSH_DISABLE_LATENCY_MEASUREMENT_ENV_VAR = (
     f'{SKYPILOT_ENV_VAR_PREFIX}SSH_DISABLE_LATENCY_MEASUREMENT')

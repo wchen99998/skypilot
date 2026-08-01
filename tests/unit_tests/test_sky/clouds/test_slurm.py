@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 import unittest.mock as mock
 
@@ -535,6 +536,13 @@ def assert_sbatch_matches_snapshot(test_name: str,
     If UPDATE_SNAPSHOT=1 env var is set, updates the snapshot file instead
     of comparing.
     """
+    syntax_check = subprocess.run(['bash', '-n'],
+                                  input=generated_script,
+                                  capture_output=True,
+                                  text=True,
+                                  check=False)
+    assert syntax_check.returncode == 0, syntax_check.stderr
+
     snapshot_path = SBATCH_TESTDATA_DIR / f'{test_name}.sh'
 
     if os.environ.get('UPDATE_SNAPSHOT') == '1':
