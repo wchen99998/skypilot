@@ -308,6 +308,7 @@ class TestTerminateInstances:
 
         cluster_name = 'test-cluster'
         provider_config = {
+            'cluster': cluster_name,
             'ssh': {
                 'hostname': 'localhost',
                 'port': '22',
@@ -316,8 +317,9 @@ class TestTerminateInstances:
             }
         }
 
-        # Mock the job state query
-        mock_client.get_jobs_state_by_name.return_value = [job_state]
+        mock_client.get_jobs_info_by_name.return_value = [
+            slurm.JobInfo('123', job_state, None, None)
+        ]
 
         slurm_instance.terminate_instances(
             cluster_name_on_cloud=cluster_name,
@@ -351,6 +353,7 @@ class TestTerminateInstances:
 
         cluster_name = 'test-cluster'
         provider_config = {
+            'cluster': cluster_name,
             'ssh': {
                 'hostname': 'localhost',
                 'port': '22',
@@ -359,8 +362,7 @@ class TestTerminateInstances:
             }
         }
 
-        # No jobs found
-        mock_client.get_jobs_state_by_name.return_value = []
+        mock_client.get_jobs_info_by_name.return_value = []
 
         slurm_instance.terminate_instances(
             cluster_name_on_cloud=cluster_name,
@@ -901,7 +903,9 @@ class TestProvisionTimeoutPassthrough:
         mock_client.get_job_nodes.return_value = (['node1'], {
             'node1': '10.0.0.5'
         })
+        mock_client.poll_interval = 0
         mock_slurm_client.return_value = mock_client
+        mock_wait_for_job_nodes.return_value = 'node1'
 
         mock_runner = mock.MagicMock()
         mock_runner.run.return_value = (0, '', '')
@@ -941,8 +945,7 @@ class TestProvisionTimeoutPassthrough:
 
         mock_wait_for_job_nodes.assert_called_once_with(mock_client, mock.ANY,
                                                         120, 'gpu', mock.ANY)
-        # get_job_nodes should be called without wait params
-        mock_client.get_job_nodes.assert_called_once_with(mock.ANY)
+        mock_client.get_job_nodes.assert_called_once_with(mock.ANY, 'node1')
 
     @patch('sky.provision.slurm.instance._wait_for_job_nodes')
     @patch('sky.provision.slurm.instance.slurm_utils.get_proctrack_type')
@@ -970,7 +973,9 @@ class TestProvisionTimeoutPassthrough:
         mock_client.get_job_nodes.return_value = (['node1'], {
             'node1': '10.0.0.5'
         })
+        mock_client.poll_interval = 0
         mock_slurm_client.return_value = mock_client
+        mock_wait_for_job_nodes.return_value = 'node1'
 
         mock_runner = mock.MagicMock()
         mock_runner.run.return_value = (0, '', '')
@@ -1011,8 +1016,7 @@ class TestProvisionTimeoutPassthrough:
         # provision_timeout=120 should be passed to _wait_for_job_nodes
         mock_wait_for_job_nodes.assert_called_once_with(mock_client, mock.ANY,
                                                         120, 'gpu', mock.ANY)
-        # get_job_nodes should be called without wait params
-        mock_client.get_job_nodes.assert_called_once_with(mock.ANY)
+        mock_client.get_job_nodes.assert_called_once_with(mock.ANY, 'node1')
 
 
 class TestCreateVirtualInstance:
@@ -1034,6 +1038,7 @@ class TestCreateVirtualInstance:
         mock_client.get_job_nodes.return_value = (['node1'], {
             'node1': '10.0.0.5'
         })
+        mock_client.poll_interval = 0
         mock_slurm_client.return_value = mock_client
 
         mock_runner = mock.MagicMock()

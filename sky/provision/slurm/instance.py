@@ -18,7 +18,6 @@ from sky.provision import constants
 from sky.provision.slurm import utils as slurm_utils
 from sky.skylet import constants as skylet_constants
 from sky.utils import command_runner
-from sky.utils import common_utils
 from sky.utils import env_options
 from sky.utils import rich_utils
 from sky.utils import status_lib
@@ -35,9 +34,31 @@ def _sbatch_log_path(base_dir: str, job_id: str) -> str:
     return f'{base_dir}/{PROVISION_SCRIPTS_DIRECTORY_NAME}/slurm-{job_id}.out'
 
 
-POLL_INTERVAL_SECONDS = 2
 # Default KillWait is 30 seconds, so we add some buffer time here.
 _JOB_TERMINATION_TIMEOUT_SECONDS = 60
+
+
+def _get_poll_interval(provider_config: Dict[str, Any]) -> int:
+    poll_interval = provider_config.get('poll_interval')
+    if poll_interval is not None:
+        return poll_interval
+    cluster = slurm_utils.get_slurm_cluster_from_config(provider_config)
+    return slurm_utils.get_poll_interval(cluster)
+
+
+_TERMINAL_JOB_STATES = frozenset({
+    'BOOT_FAIL',
+    'CANCELLED',
+    'COMPLETED',
+    'DEADLINE',
+    'FAILED',
+    'NODE_FAIL',
+    'OUT_OF_MEMORY',
+    'PREEMPTED',
+    'REVOKED',
+    'SPECIAL_EXIT',
+    'TIMEOUT',
+})
 
 # sbatch options that SkyPilot controls and must not be overridden by users.
 # These are either set dynamically based on the resource spec, or are required
@@ -183,7 +204,7 @@ def _wait_for_job_nodes(
     timeout: int,
     partition: str,
     on_pending: Callable[[str, Optional[str], Optional[int]], None],
-) -> None:
+) -> str:
     """Wait for a Slurm job to have nodes allocated.
 
     Args:
@@ -191,48 +212,44 @@ def _wait_for_job_nodes(
         job_id: The Slurm job ID.
         timeout: Maximum time to wait in seconds. If negative, wait
             indefinitely.
-        partition: Optional partition name for querying pending job count.
+        partition: Partition name (unused; retained for call compatibility).
         on_pending: Optional callback invoked when the job is pending or
             configuring. Called with (state, reason, pending_count) where
             reason and pending_count may be None.
-    """
-    start_time = time.time()
-    last_state = None
 
-    while timeout < 0 or time.time() - start_time < timeout:
-        state = client.get_job_state(job_id)
+    Returns:
+        The allocated Slurm nodelist.
+    """
+    del partition
+    last_state = None
+    deadline = None if timeout < 0 else time.monotonic() + timeout
+
+    while True:
+        try:
+            job_info = client.get_job_info(job_id, deadline=deadline)
+        except TimeoutError:
+            if deadline is not None:
+                time.sleep(max(0, deadline - time.monotonic()))
+            break
+        if job_info is None:
+            raise RuntimeError(f'Job {job_id} not found. It may have been '
+                               'cancelled or failed.')
+        state = job_info.state
 
         if state != last_state:
             logger.debug(f'Job {job_id} state: {state}')
             last_state = state
 
-        if state is None:
-            raise RuntimeError(f'Job {job_id} not found. It may have been '
-                               'cancelled or failed.')
-
-        if state in ('COMPLETED', 'CANCELLED', 'FAILED', 'TIMEOUT'):
+        if state in _TERMINAL_JOB_STATES:
             raise RuntimeError(f'Job {job_id} terminated with state {state} '
                                'before nodes were allocated.')
 
         if state in ('PENDING', 'CONFIGURING') and on_pending is not None:
-            try:
-                reason = client.get_job_reason(job_id)
-                pending_count: Optional[int] = None
-                if partition is not None:
-                    pending_count = client.get_pending_job_count(
-                        partition, exclude_job_id=job_id)
-                    if pending_count < 0:
-                        pending_count = None
-                on_pending(state, reason, pending_count)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.debug(f'Failed to get pending status for job '
-                             f'{job_id}: {e}')
+            on_pending(state, job_info.reason, None)
 
-        if client.check_job_has_nodes(job_id):
+        if job_info.nodelist is not None:
             logger.debug(f'Job {job_id} has nodes allocated')
-            return
-
-        time.sleep(2)
+            return job_info.nodelist
 
     raise TimeoutError(f'Job {job_id} did not get nodes allocated within '
                        f'{timeout} seconds. Last state: {last_state}')
@@ -285,8 +302,6 @@ def _wait_for_job_ready(
     1. The job exits/fails (state not in PENDING/RUNNING/CONFIGURING)
     2. The ready signal file never appears
     """
-    poll_interval_seconds = 1
-
     while True:
         rc, _, _ = login_node_runner.run(f'test -f {ready_signal}',
                                          require_outputs=True,
@@ -294,15 +309,14 @@ def _wait_for_job_ready(
         if rc == 0:
             return
 
-        job_state = client.get_job_state(job_id)
+        job_info = client.get_job_info(job_id)
+        job_state = None if job_info is None else job_info.state
         # Job states that indicate the job is still initializing
         # See: https://slurm.schedmd.com/squeue.html#SECTION_JOB-STATE-CODES
         if job_state not in ('PENDING', 'RUNNING', 'CONFIGURING'):
             raise RuntimeError(f'Slurm job {job_id} exited ({job_state}) '
                                'before initialization completed. See sbatch '
                                f'logs for details: {slurm_log}')
-
-        time.sleep(poll_interval_seconds)
 
 
 @timeline.event
@@ -333,6 +347,7 @@ def _create_virtual_instance(
         ssh_proxy_command=ssh_proxy_command,
         ssh_proxy_jump=ssh_proxy_jump,
         identities_only=identities_only,
+        poll_interval=_get_poll_interval(provider_config),
     )
 
     slurm_cluster = slurm_utils.get_slurm_cluster_from_config(provider_config)
@@ -350,34 +365,34 @@ def _create_virtual_instance(
     # cancelled or has finished. Jobs can get stuck in COMPLETING if epilog
     # scripts hang or tasks don't respond to signals, so we wait with a
     # timeout.
-    completing_jobs = client.query_jobs(
-        cluster_name_on_cloud,
-        ['completing'],
-    )
+    job_infos = client.get_jobs_info_by_name(cluster_name_on_cloud)
+    completing_jobs = [
+        job.job_id for job in job_infos if job.state == 'COMPLETING'
+    ]
+    termination_timeout = max(_JOB_TERMINATION_TIMEOUT_SECONDS,
+                              client.poll_interval)
     start_time = time.time()
-    while (completing_jobs and
-           time.time() - start_time < _JOB_TERMINATION_TIMEOUT_SECONDS):
+    while (completing_jobs and time.time() - start_time < termination_timeout):
         logger.debug(f'Found {len(completing_jobs)} completing jobs. '
                      f'Waiting for them to finish: {completing_jobs}')
-        time.sleep(POLL_INTERVAL_SECONDS)
-        completing_jobs = client.query_jobs(
-            cluster_name_on_cloud,
-            ['completing'],
-        )
+        job_infos = client.get_jobs_info_by_name(cluster_name_on_cloud)
+        completing_jobs = [
+            job.job_id for job in job_infos if job.state == 'COMPLETING'
+        ]
     if completing_jobs:
         # TODO(kevin): Automatically handle this, following the suggestions in
         # https://slurm.schedmd.com/troubleshoot.html#completing
         raise RuntimeError(f'Found {len(completing_jobs)} jobs still in '
                            'completing state after '
-                           f'{_JOB_TERMINATION_TIMEOUT_SECONDS}s. '
+                           f'{termination_timeout}s. '
                            'This is typically due to non-killable processes '
                            'associated with the job.')
 
     # Check if job already exists
-    existing_jobs = client.query_jobs(
-        cluster_name_on_cloud,
-        ['pending', 'running'],
-    )
+    existing_jobs = [
+        job for job in job_infos
+        if job.state in ('PENDING', 'CONFIGURING', 'RUNNING')
+    ]
 
     provision_timeout: int = provider_config['provision_timeout']
     wait_str = ('indefinitely'
@@ -420,14 +435,17 @@ def _create_virtual_instance(
             f'Multiple jobs found with name {cluster_name_on_cloud}: '
             f'{existing_jobs}')
 
-        job_id = existing_jobs[0]
+        existing_job = existing_jobs[0]
+        job_id = existing_job.job_id
         logger.debug(f'Job with name {cluster_name_on_cloud} already exists '
                      f'(JOBID: {job_id})')
 
         # Wait for nodes to be allocated (job might be in PENDING state)
-        _wait_for_job_nodes(client, job_id, provision_timeout, partition,
-                            _on_pending)
-        nodes, _ = client.get_job_nodes(job_id)
+        nodelist = existing_job.nodelist
+        if nodelist is None:
+            nodelist = _wait_for_job_nodes(client, job_id, provision_timeout,
+                                           partition, _on_pending)
+        nodes, _ = client.get_job_nodes(job_id, nodelist)
         # Reset spinner since nodes are now allocated
         rich_utils.force_update_status(
             ux_utils.spinner_message('Launching', cluster_name=cluster_name))
@@ -709,9 +727,9 @@ touch {sky_cluster_home_dir}/.hushlogin
                  f'{partition} for cluster {cluster_name_on_cloud} '
                  f'with {num_nodes} nodes')
 
-    _wait_for_job_nodes(client, job_id, provision_timeout, partition,
-                        _on_pending)
-    nodes, _ = client.get_job_nodes(job_id)
+    nodelist = _wait_for_job_nodes(client, job_id, provision_timeout, partition,
+                                   _on_pending)
+    nodes, _ = client.get_job_nodes(job_id, nodelist)
     # Reset spinner since nodes are now allocated
     rich_utils.force_update_status(
         ux_utils.spinner_message('Launching', cluster_name=cluster_name))
@@ -768,7 +786,6 @@ touch {sky_cluster_home_dir}/.hushlogin
                                   created_instance_ids=created_instance_ids)
 
 
-@common_utils.retry
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
@@ -797,6 +814,7 @@ def query_instances(
         ssh_proxy_command=ssh_proxy_command,
         ssh_proxy_jump=ssh_proxy_jump,
         identities_only=identities_only,
+        poll_interval=_get_poll_interval(provider_config),
     )
 
     # Map Slurm job states to SkyPilot ClusterStatus
@@ -805,6 +823,7 @@ def query_instances(
     # TODO(kevin): Include more states here.
     status_map = {
         'pending': status_lib.ClusterStatus.INIT,
+        'configuring': status_lib.ClusterStatus.INIT,
         'running': status_lib.ClusterStatus.UP,
         'completing': status_lib.ClusterStatus.UP,
         'completed': None,
@@ -818,36 +837,30 @@ def query_instances(
 
     statuses: Dict[str, Tuple[Optional[status_lib.ClusterStatus],
                               Optional[str]]] = {}
-    for state, sky_status in status_map.items():
-        jobs = client.query_jobs(
-            cluster_name_on_cloud,
-            [state],
-        )
+    jobs = client.get_jobs_info_by_name(cluster_name_on_cloud, all_states=True)
+    for job in jobs:
+        state = job.state.lower()
+        if state not in status_map:
+            continue
+        sky_status = status_map[state]
+        if state in ('pending', 'configuring', 'failed', 'node_fail',
+                     'cancelled', 'completed'):
+            if non_terminated_only and sky_status is None:
+                logger.debug(f'Job {job.job_id} is terminated, but '
+                             'query_instances is called with '
+                             f'non_terminated_only=True. State: {state}, '
+                             f'Reason: {job.reason}')
+                continue
+            statuses[job.job_id] = (sky_status, job.reason)
+        elif job.nodelist is not None:
+            for node in slurm.hostlist.expand_hostlist(job.nodelist):
+                instance_id = slurm_utils.instance_id(job.job_id, node)
+                statuses[instance_id] = (sky_status, None)
 
-        for job_id in jobs:
-            if state in ('pending', 'failed', 'node_fail', 'cancelled',
-                         'completed'):
-                reason = client.get_job_reason(job_id)
-                if non_terminated_only and sky_status is None:
-                    # TODO(kevin): For better UX, we should also find out
-                    # which node(s) exactly that failed if it's a node_fail
-                    # state.
-                    logger.debug(f'Job {job_id} is terminated, but '
-                                 'query_instances is called with '
-                                 f'non_terminated_only=True. State: {state}, '
-                                 f'Reason: {reason}')
-                    continue
-                statuses[job_id] = (sky_status, reason)
-            else:
-                nodes, _ = client.get_job_nodes(job_id)
-                for node in nodes:
-                    instance_id = slurm_utils.instance_id(job_id, node)
-                    statuses[instance_id] = (sky_status, None)
-
-        # TODO(kevin): Query sacct too to get more historical job info.
-        # squeue only includes completed jobs that finished in the last
-        # MinJobAge seconds (default 300s). Or could be earlier if it
-        # reaches MaxJobCount first (default 10_000).
+    # TODO(kevin): Query sacct too to get more historical job info.
+    # squeue only includes completed jobs that finished in the last
+    # MinJobAge seconds (default 300s). Or could be earlier if it
+    # reaches MaxJobCount first (default 10_000).
 
     return statuses
 
@@ -895,13 +908,14 @@ def get_cluster_info(
         ssh_proxy_command=ssh_proxy_command,
         ssh_proxy_jump=ssh_proxy_jump,
         identities_only=identities_only,
+        poll_interval=_get_poll_interval(provider_config),
     )
 
     # Find running job for this cluster
-    running_jobs = client.query_jobs(
-        cluster_name_on_cloud,
-        ['running'],
-    )
+    running_jobs = [
+        job for job in client.get_jobs_info_by_name(cluster_name_on_cloud)
+        if job.state == 'RUNNING'
+    ]
 
     if not running_jobs:
         # No running jobs found - cluster may be in pending or terminated state
@@ -915,9 +929,11 @@ def get_cluster_info(
         f'Multiple running jobs found for cluster {cluster_name_on_cloud}: '
         f'{running_jobs}')
 
-    job_id = running_jobs[0]
+    job = running_jobs[0]
+    job_id = job.job_id
     # Running jobs should already have nodes allocated
-    nodes, node_ips = client.get_job_nodes(job_id)
+    assert job.nodelist is not None, job
+    nodes, node_ips = client.get_job_nodes(job_id, job.nodelist)
 
     instances = {
         f'{slurm_utils.instance_id(job_id, node)}': [
@@ -973,7 +989,9 @@ def terminate_instances(
     # TODO(kevin): Validate this assumption.
     if slurm_utils.is_inside_slurm_cluster():
         logger.debug('Running inside a Slurm cluster, using local execution')
-        client = slurm.SlurmClient(is_inside_slurm_cluster=True)
+        client = slurm.SlurmClient(
+            is_inside_slurm_cluster=True,
+            poll_interval=_get_poll_interval(provider_config))
     else:
         ssh_config_dict = provider_config['ssh']
         ssh_host = ssh_config_dict['hostname']
@@ -992,23 +1010,19 @@ def terminate_instances(
             ssh_proxy_command=ssh_proxy_command,
             ssh_proxy_jump=ssh_proxy_jump,
             identities_only=identities_only,
+            poll_interval=_get_poll_interval(provider_config),
         )
-    jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
-    if not jobs_state:
+    jobs = client.get_jobs_info_by_name(cluster_name_on_cloud)
+    if not jobs:
         logger.debug(f'Job for cluster {cluster_name_on_cloud} not found, '
                      'it may have been terminated.')
         return
-    assert len(jobs_state) == 1, (
-        f'Multiple jobs found for cluster {cluster_name_on_cloud}: {jobs_state}'
-    )
+    assert len(jobs) == 1, (
+        f'Multiple jobs found for cluster {cluster_name_on_cloud}: {jobs}')
 
-    job_state = jobs_state[0].strip()
+    job_state = jobs[0].state
     # Terminal states where scancel is not needed or will fail.
-    terminal_states = {
-        'COMPLETED', 'CANCELLED', 'FAILED', 'TIMEOUT', 'NODE_FAIL', 'PREEMPTED',
-        'SPECIAL_EXIT'
-    }
-    if job_state in terminal_states:
+    if job_state in _TERMINAL_JOB_STATES:
         logger.debug(
             f'Job for cluster {cluster_name_on_cloud} is already in a terminal '
             f'state {job_state}. No action needed.')

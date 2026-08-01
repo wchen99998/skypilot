@@ -249,8 +249,102 @@ class TestGetJobsStateByName:
             assert result == ['RUNNING', 'PENDING', 'RUNNING']
 
 
+class TestGetJobInfo:
+    """Test consolidated Slurm job queries."""
+
+    def test_get_jobs_info_by_name(self):
+        client = slurm.SlurmClient(ssh_host='localhost',
+                                   ssh_port=22,
+                                   ssh_user='root')
+        output = (
+            f'123{slurm.SEP}PENDING{slurm.SEP}(null){slurm.SEP}Resources\n'
+            f'124{slurm.SEP}RUNNING{slurm.SEP}nid[001-002]'
+            f'{slurm.SEP}None\n')
+
+        with mock.patch.object(client._runner, 'run') as mock_run:
+            mock_run.return_value = (0, output, '')
+            result = client.get_jobs_info_by_name('sky-test', all_states=True)
+
+        mock_run.assert_called_once_with(
+            f'squeue --me -h --name sky-test --states all '
+            f'-o "%i{slurm.SEP}%T{slurm.SEP}%N{slurm.SEP}%r"',
+            require_outputs=True,
+            separate_stderr=True,
+            stream_logs=False,
+        )
+        assert result == [
+            slurm.JobInfo('123', 'PENDING', None, 'Resources'),
+            slurm.JobInfo('124', 'RUNNING', 'nid[001-002]', None),
+        ]
+
+    def test_scheduler_queries_share_cadence(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(slurm, '_SCHEDULER_QUERY_LOCK_DIR', str(tmp_path))
+        now = 1000.0
+
+        def sleep(seconds):
+            nonlocal now
+            now += seconds
+
+        monkeypatch.setattr(slurm.time, 'time', lambda: now)
+        client1 = slurm.SlurmClient(ssh_host='localhost',
+                                    ssh_port=22,
+                                    ssh_user='root',
+                                    poll_interval=60)
+        client2 = slurm.SlurmClient(ssh_host='localhost',
+                                    ssh_port=22,
+                                    ssh_user='root',
+                                    poll_interval=2)
+        client3 = slurm.SlurmClient(ssh_host='localhost',
+                                    ssh_port=22,
+                                    ssh_user='root',
+                                    poll_interval=60)
+        client1._runner.run = mock.Mock(return_value=(0, '', ''))
+        client2._runner.run = mock.Mock(return_value=(0, '', ''))
+        client3._runner.run = mock.Mock(return_value=(0, '', ''))
+
+        with mock.patch.object(slurm.time, 'sleep',
+                               side_effect=sleep) as sleep_mock:
+            client1.info()
+            client2.get_jobs_info_by_name('sky-test')
+            client3.info()
+
+        assert sleep_mock.call_args_list == [mock.call(60), mock.call(60)]
+
+    def test_scheduler_query_deadline_bounds_lock(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(slurm, '_SCHEDULER_QUERY_LOCK_DIR', str(tmp_path))
+        monkeypatch.setattr(slurm.time, 'monotonic', lambda: 100.0)
+        client = slurm.SlurmClient(ssh_host='localhost',
+                                   ssh_port=22,
+                                   ssh_user='root',
+                                   poll_interval=60)
+        client._runner.run = mock.Mock(return_value=(0, '', ''))
+
+        with mock.patch.object(slurm.filelock, 'FileLock') as lock_cls:
+            lock_cls.return_value.acquire.side_effect = slurm.filelock.Timeout(
+                'test.lock')
+            with pytest.raises(TimeoutError):
+                client.get_job_info('123', deadline=110.0)
+
+        lock_cls.return_value.acquire.assert_called_once_with(timeout=10.0)
+        client._runner.run.assert_not_called()
+
+
 class TestSlurmClientInit:
     """Test SlurmClient.__init__()."""
+
+    def test_check_file_exists_retries_transient_ssh_failure(self):
+        client = slurm.SlurmClient(ssh_host='localhost',
+                                   ssh_port=22,
+                                   ssh_user='root')
+        client._runner.run = mock.Mock(side_effect=[
+            (255, '', 'kex_exchange_identification: Connection reset by peer'),
+            (0, '', ''),
+        ])
+
+        with mock.patch('sky.utils.common_utils.time.sleep'):
+            assert client.check_file_exists('/shared/marker')
+
+        assert client._runner.run.call_count == 2
 
     def test_init_local_execution_mode(self):
         """Test that is_inside_slurm_cluster=True uses LocalProcessCommandRunner."""
@@ -285,11 +379,12 @@ class TestGetJobNodes:
         with mock.patch.object(client._runner, 'run') as mock_run:
             mock_run.return_value = (0, 'node1 10.0.0.1\nnode2 10.0.0.2', '')
 
-            nodes, node_ips = client.get_job_nodes('12345')
+            nodes, node_ips = client.get_job_nodes('12345', 'node[1-2]')
 
             assert nodes == ['node1', 'node2']
             assert node_ips == ['10.0.0.1', '10.0.0.2']
             assert mock_run.call_count == 1
+            assert 'squeue' not in mock_run.call_args.args[0]
 
     def test_get_job_nodes_resolves_hostnames_via_login_node(self):
         """Test hostnames are resolved via getent ahostsv4 on the login node."""
@@ -308,7 +403,7 @@ class TestGetJobNodes:
                 (0, 'worker-1 10.20.30.1\nworker-10 10.20.30.10', ''),
             ]
 
-            nodes, node_ips = client.get_job_nodes('12345')
+            nodes, node_ips = client.get_job_nodes('12345', 'worker-[1,10]')
 
             assert nodes == ['worker-1', 'worker-10']
             assert node_ips == ['10.20.30.1', '10.20.30.10']
@@ -344,7 +439,7 @@ class TestGetJobNodes:
 
             with pytest.raises(RuntimeError,
                                match='Failed to resolve hostnames'):
-                client.get_job_nodes('12345')
+                client.get_job_nodes('12345', 'worker-[1,10]')
 
 
 class TestGetAllJobsGres:

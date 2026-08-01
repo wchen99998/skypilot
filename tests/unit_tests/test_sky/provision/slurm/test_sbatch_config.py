@@ -12,7 +12,79 @@ from sky.provision.slurm.instance import _build_custom_sbatch_directives
 from sky.provision.slurm.instance import _build_sbatch_directives
 from sky.provision.slurm.instance import _compute_time_directive
 from sky.provision.slurm.instance import _SBATCH_PROTECTED_OPTIONS
+from sky.provision.slurm.instance import _wait_for_job_nodes
 from sky.utils.schemas import get_config_schema
+
+
+def test_wait_for_job_nodes_uses_scheduler_deadline():
+    client = slurm_adaptor.SlurmClient(ssh_host='localhost',
+                                       ssh_port=22,
+                                       ssh_user='user',
+                                       ssh_key=None,
+                                       poll_interval=60)
+    client.get_job_info = mock.Mock(side_effect=[
+        slurm_adaptor.JobInfo('123', 'PENDING', None, 'Resources'),
+        TimeoutError,
+    ])
+
+    with mock.patch('sky.provision.slurm.instance.time.monotonic',
+                    return_value=10), mock.patch(
+                        'sky.provision.slurm.instance.time.sleep'
+                    ) as sleep_mock, pytest.raises(TimeoutError,
+                                                   match='within 90 seconds'):
+        _wait_for_job_nodes(client, '123', 90, 'workq',
+                            lambda state, reason, count: None)
+
+    sleep_mock.assert_called_once_with(90)
+    assert client.get_job_info.call_args_list == [
+        mock.call('123', deadline=100),
+        mock.call('123', deadline=100),
+    ]
+
+
+@pytest.mark.parametrize('state', sorted(slurm_instance._TERMINAL_JOB_STATES))
+def test_wait_for_job_nodes_stops_on_terminal_state(state):
+    client = slurm_adaptor.SlurmClient(ssh_host='localhost',
+                                       ssh_port=22,
+                                       ssh_user='user',
+                                       ssh_key=None,
+                                       poll_interval=0)
+    client.get_job_info = mock.Mock(
+        return_value=slurm_adaptor.JobInfo('123', state, None, None))
+
+    with pytest.raises(RuntimeError, match=f'terminated with state {state}'):
+        _wait_for_job_nodes(client, '123', -1, 'workq',
+                            lambda state, reason, count: None)
+
+
+def test_query_instances_uses_one_consolidated_query():
+    provider_config = {
+        'ssh': {
+            'hostname': 'login.example.com',
+            'port': 22,
+            'user': 'user',
+        },
+        'poll_interval': 60,
+    }
+    jobs = [
+        slurm_adaptor.JobInfo('123', 'PENDING', None, 'Resources'),
+        slurm_adaptor.JobInfo('125', 'CONFIGURING', None, 'Configuring'),
+        slurm_adaptor.JobInfo('124', 'RUNNING', 'nid[001-002]', None),
+    ]
+
+    with mock.patch.object(slurm_adaptor, 'SlurmClient') as client_cls:
+        client_cls.return_value.get_jobs_info_by_name.return_value = jobs
+        result = slurm_instance.query_instances('cluster', 'sky-cluster',
+                                                provider_config)
+
+    client_cls.return_value.get_jobs_info_by_name.assert_called_once_with(
+        'sky-cluster', all_states=True)
+    assert result == {
+        '123': (slurm_instance.status_lib.ClusterStatus.INIT, 'Resources'),
+        '125': (slurm_instance.status_lib.ClusterStatus.INIT, 'Configuring'),
+        'job124-nid001': (slurm_instance.status_lib.ClusterStatus.UP, None),
+        'job124-nid002': (slurm_instance.status_lib.ClusterStatus.UP, None),
+    }
 
 
 class TestBuildCustomSbatchDirectives:
@@ -309,6 +381,22 @@ class TestSbatchConfigSchema:
                 }
             }
         })
+
+    def test_valid_poll_intervals(self):
+        self._validate({
+            'slurm': {
+                'poll_interval': 60,
+                'cluster_configs': {
+                    'mycluster': {
+                        'poll_interval': 120,
+                    },
+                },
+            },
+        })
+
+    def test_invalid_poll_interval(self):
+        with pytest.raises(jsonschema.ValidationError):
+            self._validate({'slurm': {'poll_interval': 0}})
 
     def test_valid_cluster_level(self):
         self._validate({

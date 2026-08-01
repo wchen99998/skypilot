@@ -559,6 +559,11 @@ class Slurm(clouds.Cloud):
                 # have seen Slurm taking minutes to schedule a job, when there
                 # are a lot of pending jobs to be processed.
                 provision_timeout = 2 * 60  # 2 minutes
+        poll_interval = skypilot_config.get_effective_region_config(
+            cloud='slurm',
+            region=cluster,
+            keys=('poll_interval',),
+            default_value=slurm.DEFAULT_POLL_INTERVAL_SECONDS)
 
         # Read sbatch_options with three-level merge:
         # global < cluster < partition.
@@ -592,6 +597,7 @@ class Slurm(clouds.Cloud):
             'slurm_cluster': cluster,
             'slurm_partition': partition,
             'provision_timeout': provision_timeout,
+            'poll_interval': poll_interval,
             # TODO(jwj): Pass SSH config in a smarter way
             'ssh_hostname': ssh_config_dict['hostname'],
             'ssh_port': str(ssh_config_dict.get('port', 22)),
@@ -795,6 +801,7 @@ class Slurm(clouds.Cloud):
                     ssh_proxy_jump=ssh_config_dict.get('proxyjump', None),
                     identities_only=slurm_utils.get_identities_only(
                         ssh_config_dict),
+                    poll_interval=slurm_utils.get_poll_interval(cluster),
                 )
                 info = client.info()
                 logger.debug(f'Slurm cluster {cluster} sinfo: {info}')

@@ -140,6 +140,7 @@ Below is the configuration syntax and some example values. See detailed explanat
       - mycluster1
       - mycluster2
     :ref:`provision_timeout <config-yaml-slurm-provision-timeout>`: 120
+    :ref:`poll_interval <config-yaml-slurm-poll-interval>`: 60
     :ref:`pricing <config-yaml-slurm-pricing>`:
       cpu: 0.04        # $/vCPU/hr
       memory: 0.01     # $/GB/hr
@@ -2284,6 +2285,25 @@ Example:
   slurm:
     provision_timeout: 1200
 
+.. _config-yaml-slurm-poll-interval:
+
+``slurm.poll_interval``
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Seconds between repeated Slurm status queries (optional).
+
+Set this to the minimum interval required by your cluster's scheduler policy.
+It can also be set per cluster under ``slurm.cluster_configs``.
+
+Default: ``2``.
+
+Example:
+
+.. code-block:: yaml
+
+  slurm:
+    poll_interval: 60
+
 .. _config-yaml-slurm-pricing:
 
 ``slurm.pricing``
@@ -2418,6 +2438,9 @@ Supported fields:
 
 - ``tmpdir``: Per-node temporary storage for the SkyPilot runtime.
   Defaults to ``/tmp``.
+
+- ``poll_interval``: Seconds between repeated Slurm status queries.
+  Defaults to the global ``slurm.poll_interval`` value.
 
 - ``pricing``: :ref:`Pricing <config-yaml-slurm-pricing>` overrides at both
   the cluster and partition level. Pricing at each level is deep-merged with the

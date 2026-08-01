@@ -1,13 +1,19 @@
 """Slurm adaptor for SkyPilot."""
 
+import hashlib
 import ipaddress
 import logging
+import os
 import re
 import shlex
+import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
+
+import filelock
 
 from sky.adaptors import common
 from sky.utils import command_runner
+from sky.utils import common_utils
 from sky.utils import subprocess_utils
 from sky.utils import timeline
 
@@ -36,6 +42,8 @@ hostlist = common.LazyImport('hostlist',
                              import_error_message=_IMPORT_ERROR_MESSAGE)
 
 _UNRESOLVED_HOSTNAME_MARKER = 'UNRESOLVED'
+DEFAULT_POLL_INTERVAL_SECONDS = 2
+_SCHEDULER_QUERY_LOCK_DIR = os.path.expanduser('~/.sky/locks')
 
 
 class SlurmPartition(NamedTuple):
@@ -62,6 +70,14 @@ class NodeInfo(NamedTuple):
     # The default partition contains a '*' at the end of the name.
     # It is the caller's responsibility to strip the '*' if needed.
     partition: str
+
+
+class JobInfo(NamedTuple):
+    """Information about a Slurm job from squeue."""
+    job_id: str
+    state: str
+    nodelist: Optional[str]
+    reason: Optional[str]
 
 
 def _parse_maxtime(line: str) -> Optional[int]:
@@ -114,6 +130,7 @@ class SlurmClient:
         ssh_proxy_jump: Optional[str] = None,
         is_inside_slurm_cluster: bool = False,
         identities_only: Optional[bool] = None,
+        poll_interval: Optional[int] = None,
     ):
         """Initialize SlurmClient.
 
@@ -129,6 +146,8 @@ class SlurmClient:
             identities_only: If True, only use the specified identity file and
                 don't try ssh-agent keys. If None, defaults to False (allows
                 ssh-agent fallback for backward compatibility).
+            poll_interval: Minimum seconds between squeue/sinfo calls to this
+                controller. None disables cross-process throttling.
         """
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
@@ -136,6 +155,9 @@ class SlurmClient:
         self.ssh_key = ssh_key
         self.ssh_proxy_command = ssh_proxy_command
         self.ssh_proxy_jump = ssh_proxy_jump
+        self.poll_interval = (DEFAULT_POLL_INTERVAL_SECONDS
+                              if poll_interval is None else poll_interval)
+        self._scheduler_query_interval = poll_interval
 
         self._runner: command_runner.CommandRunner
 
@@ -160,11 +182,60 @@ class SlurmClient:
                 disable_identities_only=not identities_only,
             )
 
-    def _run_slurm_cmd(self, cmd: str) -> Tuple[int, str, str]:
-        return self._runner.run(cmd,
-                                require_outputs=True,
-                                separate_stderr=True,
-                                stream_logs=False)
+    def _run_slurm_cmd(
+        self,
+        cmd: str,
+        deadline: Optional[float] = None,
+    ) -> Tuple[int, str, str]:
+
+        def _run() -> Tuple[int, str, str]:
+            return self._runner.run(cmd,
+                                    require_outputs=True,
+                                    separate_stderr=True,
+                                    stream_logs=False)
+
+        command = cmd.lstrip().split(maxsplit=1)[0]
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError
+        if (self._scheduler_query_interval is None or
+                command not in ('squeue', 'sinfo')):
+            return _run()
+
+        controller = f'{self.ssh_user}@{self.ssh_host}:{self.ssh_port}'
+        controller_hash = hashlib.sha256(controller.encode()).hexdigest()[:16]
+        os.makedirs(_SCHEDULER_QUERY_LOCK_DIR, exist_ok=True)
+        path_prefix = os.path.join(_SCHEDULER_QUERY_LOCK_DIR,
+                                   f'.slurm-query-{controller_hash}')
+        state_path = f'{path_prefix}.state'
+        lock_timeout = (-1 if deadline is None else max(
+            0, deadline - time.monotonic()))
+        try:
+            with filelock.FileLock(f'{path_prefix}.lock').acquire(
+                    timeout=lock_timeout):
+                now = time.time()
+                wait_seconds = 0.0
+                if os.path.exists(state_path):
+                    with open(state_path, encoding='utf-8') as state_file:
+                        last_query, previous_interval = map(
+                            float,
+                            state_file.read().split())
+                    query_interval = max(self._scheduler_query_interval,
+                                         previous_interval)
+                    wait_seconds = max(0, last_query + query_interval - now)
+                if (deadline is not None and
+                        time.monotonic() + wait_seconds > deadline):
+                    raise TimeoutError
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                    now = time.time()
+                temporary_state_path = f'{state_path}.{os.getpid()}'
+                with open(temporary_state_path, 'w',
+                          encoding='utf-8') as state_file:
+                    state_file.write(f'{now} {self._scheduler_query_interval}')
+                os.replace(temporary_state_path, state_path)
+                return _run()
+        except filelock.Timeout:
+            raise TimeoutError from None
 
     def query_jobs(
         self,
@@ -197,6 +268,54 @@ class SlurmClient:
 
         job_ids = stdout.strip().splitlines()
         return job_ids
+
+    @staticmethod
+    def _parse_job_infos(output: str) -> List[JobInfo]:
+        job_infos = []
+        for line in output.splitlines():
+            parts = [part.strip() for part in line.split(SEP)]
+            if len(parts) != 4:
+                raise RuntimeError(
+                    f'Unexpected output format from squeue: {line!r}')
+            job_id, state, nodelist, reason = parts
+            if nodelist in ('', '(null)', 'N/A'):
+                nodelist = None
+            if reason in ('', 'None', '(null)', 'N/A'):
+                reason = None
+            job_infos.append(JobInfo(job_id, state, nodelist, reason))
+        return job_infos
+
+    def get_job_info(self,
+                     job_id: str,
+                     deadline: Optional[float] = None) -> Optional[JobInfo]:
+        """Get state, nodes, and reason for one job with one squeue call."""
+        cmd = (f'squeue -h --jobs {job_id} --states all '
+               f'-o "%i{SEP}%T{SEP}%N{SEP}%r"')
+        rc, stdout, stderr = self._run_slurm_cmd(cmd, deadline=deadline)
+        subprocess_utils.handle_returncode(
+            rc,
+            cmd,
+            f'Failed to get job information for job {job_id}.',
+            stderr=f'{stdout}\n{stderr}',
+            stream_logs=False)
+        job_infos = self._parse_job_infos(stdout)
+        return job_infos[0] if job_infos else None
+
+    def get_jobs_info_by_name(self,
+                              job_name: str,
+                              all_states: bool = False) -> List[JobInfo]:
+        """Get state, nodes, and reason for jobs with one squeue call."""
+        states_arg = ' --states all' if all_states else ''
+        cmd = (f'squeue --me -h --name {job_name}{states_arg} '
+               f'-o "%i{SEP}%T{SEP}%N{SEP}%r"')
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        subprocess_utils.handle_returncode(
+            rc,
+            cmd,
+            f'Failed to get job information for jobs named {job_name}.',
+            stderr=f'{stdout}\n{stderr}',
+            stream_logs=False)
+        return self._parse_job_infos(stdout)
 
     def cancel_jobs_by_name(self,
                             job_name: str,
@@ -461,7 +580,8 @@ class SlurmClient:
         return bool(stdout.strip())
 
     @timeline.event
-    def get_job_nodes(self, job_id: str) -> Tuple[List[str], List[str]]:
+    def get_job_nodes(self, job_id: str,
+                      nodelist: str) -> Tuple[List[str], List[str]]:
         """Get the list of nodes and their IPs for a given job ID.
 
         The ordering is guaranteed to be stable for the lifetime of the job.
@@ -474,13 +594,14 @@ class SlurmClient:
             and node_ips is a list of corresponding IP addresses.
         """
 
+        nodelist_command = f'nodelist={shlex.quote(nodelist)}; '
         cmd = (
             # Use scontrol show hostnames to expand both compact Slurm
             # hostlist notation (e.g. ml-16-node-[001-002]) and
             # comma-separated nodes into individual node names.
             # TODO(kevin): Use json output for more robust parsing.
-            f'nodelist=$(squeue -h --jobs {job_id} -o "%N"); '
-            f'scontrol show hostnames $nodelist | while read -r node; do '
+            nodelist_command +
+            f'scontrol show hostnames "$nodelist" | while read -r node; do '
             f'node_addr=$(scontrol show node=$node | grep NodeAddr= | '
             f'awk -F= \'{{print $2}}\' | awk \'{{print $1}}\'); '
             f'echo "$node $node_addr"; '
@@ -729,6 +850,7 @@ class SlurmClient:
         """Returns the remote user's home directory."""
         return self._runner.get_remote_home_dir()
 
+    @common_utils.retry
     def check_file_exists(self, path: str) -> bool:
         """Check if a file exists on the remote host."""
         cmd = f'test -f {shlex.quote(path)}'

@@ -107,6 +107,14 @@ def get_identities_only(ssh_config_dict: Dict[str, Any]) -> bool:
     return identities_only.lower() == 'yes'
 
 
+def get_poll_interval(cluster: str) -> int:
+    return skypilot_config.get_effective_region_config(
+        cloud='slurm',
+        region=cluster,
+        keys=('poll_interval',),
+        default_value=slurm.DEFAULT_POLL_INTERVAL_SECONDS)
+
+
 @annotations.lru_cache(scope='request')
 def get_slurm_nodes_info(cluster: str) -> List[slurm.NodeInfo]:
     cache_key = f'slurm:nodes_info:{cluster}'
@@ -125,6 +133,7 @@ def get_slurm_nodes_info(cluster: str) -> List[slurm.NodeInfo]:
         ssh_proxy_command=ssh_config_dict.get('proxycommand', None),
         ssh_proxy_jump=ssh_config_dict.get('proxyjump', None),
         identities_only=get_identities_only(ssh_config_dict),
+        poll_interval=get_poll_interval(cluster),
     )
     nodes_info = client.info_nodes()
 
@@ -969,6 +978,7 @@ def _get_slurm_node_info_list(
         ssh_proxy_command=slurm_config_dict.get('proxycommand', None),
         ssh_proxy_jump=slurm_config_dict.get('proxyjump', None),
         identities_only=get_identities_only(slurm_config_dict),
+        poll_interval=get_poll_interval(slurm_cluster_name),
     )
     node_infos = slurm_client.info_nodes()
 
