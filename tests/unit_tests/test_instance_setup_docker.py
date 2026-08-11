@@ -37,9 +37,11 @@ import os
 import shutil
 import subprocess
 from typing import Dict, List, Optional, Tuple
+from unittest import mock
 
 import pytest
 
+from sky.provision import docker_utils
 from sky.provision import instance_setup
 
 # pylint: disable=protected-access
@@ -231,3 +233,78 @@ def test_nofile_limit_clamp_with_cap_sys_resource():
     limits of the raylet to _TARGET even from a tiny starting limit."""
     result = _run(['--ulimit=nofile=1024:1024', '--cap-add=SYS_RESOURCE'])
     _assert_clamp(result, start=(1024, 1024), cap=True)
+
+
+def test_pinned_maxtext_tpu_mig_docker_install_is_lifecycle_owned():
+    initializer = docker_utils.DockerInitializer(
+        {
+            'container_name': 'sky_container',
+            'image': docker_utils._TPU_MIG_MAXTEXT_IMAGE,
+            '_install_pinned_tpu_mig_docker': True,
+        },
+        runner=mock.MagicMock(),
+        log_path='/tmp/provision.log',
+    )
+    initializer._run = mock.MagicMock(
+        return_value=('SKYPILOT_TPU_MIG_DOCKER_VERIFIED='
+                      f'{docker_utils._TPU_MIG_DOCKER_VERSION} '
+                      'RUNC_VERSION=1.3.4-target'))
+
+    initializer._check_docker_installed()
+
+    initializer._run.assert_called_once_with(
+        docker_utils._TPU_MIG_DOCKER_INSTALL_CMD)
+    command = docker_utils._TPU_MIG_DOCKER_INSTALL_CMD
+    assert '--allow-change-held-packages' in command
+    assert 'apt-mark hold docker.io containerd runc' in command
+    assert 'timeout 300s' in command
+    assert 'docker.io=29.1.3-0ubuntu3~22.04.2' in command
+    assert 'containerd=2.2.1-0ubuntu1~22.04.2' in command
+    assert 'apt-cache policy runc' in command
+    assert 'test "$runc_version" != "(none)"' in command
+    assert '"runc=$runc_version"' in command
+    assert 'RUNC_VERSION="$runc_version"' in command
+    assert 'runc=1.3.4-0ubuntu1~22.04.1' not in command
+
+
+@pytest.mark.parametrize(
+    'receipt',
+    [
+        'SKYPILOT_TPU_MIG_DOCKER_VERIFIED=29.1.30 RUNC_VERSION=1.3.4',
+        'SKYPILOT_TPU_MIG_DOCKER_VERIFIED=29.1.3-extra RUNC_VERSION=1.3.4',
+        'SKYPILOT_TPU_MIG_DOCKER_VERIFIED=29.1.3',
+        'SKYPILOT_TPU_MIG_DOCKER_VERIFIED=29.1.3 RUNC_VERSION=',
+    ],
+)
+def test_pinned_maxtext_tpu_mig_docker_rejects_invalid_receipt(receipt: str,):
+    initializer = docker_utils.DockerInitializer(
+        {
+            'container_name': 'sky_container',
+            'image': docker_utils._TPU_MIG_MAXTEXT_IMAGE,
+            '_install_pinned_tpu_mig_docker': True,
+        },
+        runner=mock.MagicMock(),
+        log_path='/tmp/provision.log',
+    )
+    initializer._run = mock.MagicMock(return_value=receipt)
+
+    with pytest.raises(RuntimeError, match='Failed to verify'):
+        initializer._check_docker_installed()
+
+
+def test_pinned_install_does_not_apply_to_other_tpu_images():
+    initializer = docker_utils.DockerInitializer(
+        {
+            'container_name': 'sky_container',
+            'image': 'example.invalid/unrelated:latest',
+            '_install_pinned_tpu_mig_docker': True,
+        },
+        runner=mock.MagicMock(),
+        log_path='/tmp/provision.log',
+    )
+    initializer._run = mock.MagicMock(return_value='/usr/bin/docker')
+
+    initializer._check_docker_installed()
+
+    assert initializer._run.call_count == 1
+    assert 'command -v docker' in initializer._run.call_args.args[0]

@@ -891,13 +891,38 @@ def create_managed_instance_group(project_id: str, zone: str, group_name: str,
 
 
 def resize_managed_instance_group(project_id: str, zone: str, group_name: str,
-                                  resize_by: int, run_duration: int) -> dict:
+                                  resize_by: int,
+                                  run_duration: int) -> Optional[dict]:
     logger.debug(f'Resizing managed instance group {group_name!r} by '
                  f'{resize_by} with run duration {run_duration}.')
     compute = gcp.build('compute',
                         'beta',
                         credentials=None,
                         cache_discovery=False)
+    try:
+        request = compute.instanceGroupManagerResizeRequests().get(
+            project=project_id,
+            zone=zone,
+            instanceGroupManager=group_name,
+            resizeRequest=group_name,
+        ).execute()
+    except gcp.http_error_exception() as e:
+        if MIG_RESOURCE_NOT_FOUND_PATTERN.search(str(e)) is None:
+            raise
+    else:
+        duration = request.get('requestedRunDuration', {}).get('seconds')
+        state = request.get('state')
+        if (request.get('resizeBy') != resize_by or
+                str(duration) != str(run_duration) or state
+                not in {'ACCEPTED', 'CREATING', 'PROVISIONING', 'SUCCEEDED'}):
+            raise ValueError(
+                f'Existing resize request {group_name!r} does not match '
+                f'resizeBy={resize_by}, run duration={run_duration}, and an '
+                f'active state: {request!r}')
+        logger.info('Resuming existing resize request %r in state %s.',
+                    group_name, state)
+        return None
+
     operation = compute.instanceGroupManagerResizeRequests().insert(
         project=project_id,
         zone=zone,

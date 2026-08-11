@@ -38,6 +38,37 @@ DOCKER_SOCKET_NOT_READY_STR_2 = (
 
 _DOCKER_SOCKET_WAIT_TIMEOUT_SECONDS = 30
 
+_TPU_MIG_DOCKER_VERSION = '29.1.3'
+_TPU_MIG_MAXTEXT_IMAGE = (
+    'us-docker.pkg.dev/cloud-tpu-images/maxtext-images/'
+    'tpu_post_training@sha256:'
+    'a9bb372969ba6a9004ae9fbcd6b201c3841562828c60f79c798033653894ddf3')
+_TPU_MIG_DOCKER_INSTALL_CMD = (
+    'set -euo pipefail; '
+    'timeout 300s sudo apt-get update -qq; '
+    'runc_version="$(apt-cache policy runc | '
+    'awk \'/Candidate:/ {print $2}\')"; '
+    'test -n "$runc_version"; '
+    'test "$runc_version" != "(none)"; '
+    'timeout 300s sudo env DEBIAN_FRONTEND=noninteractive '
+    'apt-get install -y -qq --allow-downgrades '
+    '--allow-change-held-packages '
+    '"docker.io=29.1.3-0ubuntu3~22.04.2" '
+    '"containerd=2.2.1-0ubuntu1~22.04.2" '
+    '"runc=$runc_version"; '
+    'sudo apt-mark hold docker.io containerd runc >/dev/null; '
+    'timeout 30s sudo systemctl enable --now docker; '
+    'test "$(dpkg-query -W -f=\'${Version}\' docker.io)" = '
+    '"29.1.3-0ubuntu3~22.04.2"; '
+    'test "$(dpkg-query -W -f=\'${Version}\' containerd)" = '
+    '"2.2.1-0ubuntu1~22.04.2"; '
+    'test "$(dpkg-query -W -f=\'${Version}\' runc)" = '
+    '"$runc_version"; '
+    'test "$(sudo docker version --format \'{{.Server.Version}}\')" = '
+    f'"{_TPU_MIG_DOCKER_VERSION}"; '
+    f'echo SKYPILOT_TPU_MIG_DOCKER_VERIFIED={_TPU_MIG_DOCKER_VERSION} '
+    'RUNC_VERSION="$runc_version"')
+
 # Install AWS CLI v2 (not v1 from pip) as it's required for ECR authentication
 # AWS CLI v2 is installed as a standalone binary, not a Python package. See:
 # https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
@@ -494,6 +525,20 @@ class DockerInitializer:
         return docker_user
 
     def _check_docker_installed(self):
+        if (self.docker_config.get('_install_pinned_tpu_mig_docker', False) and
+                self.docker_config.get('image') == _TPU_MIG_MAXTEXT_IMAGE):
+            output = self._run(_TPU_MIG_DOCKER_INSTALL_CMD)
+            receipt_prefix = ('SKYPILOT_TPU_MIG_DOCKER_VERIFIED='
+                              f'{_TPU_MIG_DOCKER_VERSION} RUNC_VERSION=')
+            if not any(
+                    line.startswith(receipt_prefix) and
+                    line.removeprefix(receipt_prefix)
+                    for line in output.splitlines()):
+                raise RuntimeError('Failed to verify pinned TPU MIG Docker.')
+            logger.info('Pinned TPU MIG Docker %s is installed and held.',
+                        _TPU_MIG_DOCKER_VERSION)
+            return
+
         no_exist = 'NoExist'
         # SkyPilot: Add the current user to the docker group first (if needed),
         # before checking if docker is installed to avoid permission issues.

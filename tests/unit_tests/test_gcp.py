@@ -1149,6 +1149,30 @@ def test_gcp_mig_resource_names_fit_gce_limit():
         assert resource_name.startswith('sky-')
 
 
+def test_gcp_mig_resize_resumes_accepted_request(monkeypatch):
+    compute = MagicMock()
+    request = {
+        'name': 'sky-mig-cluster',
+        'resizeBy': 1,
+        'requestedRunDuration': {
+            'seconds': '604800',
+        },
+        'state': 'ACCEPTED',
+    }
+    requests = compute.instanceGroupManagerResizeRequests.return_value
+    requests.get.return_value.execute.return_value = request
+    monkeypatch.setattr(mig_utils.gcp, 'build', lambda *args, **kwargs: compute)
+
+    assert mig_utils.resize_managed_instance_group(
+        'project', 'us-central1-a', 'sky-mig-cluster', 1, 604800) is None
+    requests.insert.assert_not_called()
+
+    request['resizeBy'] = 2
+    with pytest.raises(ValueError, match='does not match'):
+        mig_utils.resize_managed_instance_group('project', 'us-central1-a',
+                                                'sky-mig-cluster', 1, 604800)
+
+
 def test_gcp_tpu_mig_compute_api_requests(monkeypatch):
     compute = MagicMock()
     workload_operation = {'name': 'workload-operation'}

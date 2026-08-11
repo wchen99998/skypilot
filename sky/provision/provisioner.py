@@ -1,5 +1,6 @@
 """Cloud-neutral VM provision utils."""
 import collections
+import copy
 import dataclasses
 import json
 import os
@@ -521,7 +522,10 @@ def _post_provision_setup(
     # We don't set docker_user here, as we are configuring the VM itself.
     ssh_credentials = backend_utils.ssh_credential_from_yaml(
         handle_cluster_yaml, ssh_user=cluster_info.ssh_user)
-    docker_config = config_from_yaml.get('docker', {})
+    docker_config = copy.deepcopy(config_from_yaml.get('docker', {}))
+    if (docker_config and
+            cluster_info.provider_config.get('_is_tpu_mig', False)):
+        docker_config['_install_pinned_tpu_mig_docker'] = True
 
     with rich_utils.safe_status(
             ux_utils.spinner_message('Launching - Waiting for SSH access',

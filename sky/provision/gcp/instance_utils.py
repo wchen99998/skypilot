@@ -1370,13 +1370,14 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
 
         if count > 0:
             # Use resize to trigger DWS for creating VMs.
-            operation = mig_utils.resize_managed_instance_group(
+            resize_operation = mig_utils.resize_managed_instance_group(
                 project_id,
                 zone,
                 managed_instance_group_name,
                 count,
                 run_duration=managed_instance_group_config['run_duration'])
-            cls.wait_for_operation(operation, project_id, zone=zone)
+            if resize_operation is not None:
+                cls.wait_for_operation(resize_operation, project_id, zone=zone)
 
         # This will block the provisioning until the nodes are ready, which
         # makes the failover not effective. We rely on the request timeout set
