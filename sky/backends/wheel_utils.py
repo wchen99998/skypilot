@@ -28,12 +28,16 @@ import sky
 from sky import sky_logging
 from sky.backends import backend_utils
 from sky.server import common
+from sky.skylet import runtime_utils
 from sky.utils import directory_utils
 
 logger = sky_logging.init_logger(__name__)
 
 # Local wheel path is same as the remote path.
-WHEEL_DIR = pathlib.Path(os.path.expanduser(backend_utils.SKY_REMOTE_PATH))
+# Keep local API server wheel caches isolated.  The remote mount target stays
+# ~/.sky/wheels; only the local build cache follows SKY_RUNTIME_DIR.
+WHEEL_DIR = pathlib.Path(runtime_utils.expanduser(
+    backend_utils.SKY_REMOTE_PATH))
 _WHEEL_LOCK_PATH = WHEEL_DIR.parent / '.wheels_lock'
 SKY_PACKAGE_PATH = pathlib.Path(directory_utils.get_sky_dir())
 

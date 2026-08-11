@@ -1,5 +1,7 @@
 """Tests for sky.skylet.runtime_utils."""
 import os
+import subprocess
+import sys
 
 from sky.skylet import constants
 from sky.skylet import runtime_utils
@@ -33,3 +35,19 @@ class TestExpanduser:
         monkeypatch.setenv(_RUNTIME_DIR_KEY, '~/runtime-a')
         assert runtime_utils.expanduser('~/.sky/x') == os.path.join(
             os.path.expanduser('~/runtime-a'), '.sky/x')
+
+
+def test_wheel_cache_is_runtime_scoped(tmp_path):
+    env = os.environ.copy()
+    env[_RUNTIME_DIR_KEY] = str(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable, '-c',
+            'from sky.backends import wheel_utils; print(wheel_utils.WHEEL_DIR)'
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.stdout.splitlines()[-1] == str(tmp_path / '.sky/wheels')
