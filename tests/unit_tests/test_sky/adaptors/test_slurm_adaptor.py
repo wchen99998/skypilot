@@ -252,6 +252,21 @@ class TestGetJobsStateByName:
 class TestGetJobInfo:
     """Test consolidated Slurm job queries."""
 
+    def test_get_job_cpus_per_task(self):
+        client = slurm.SlurmClient(ssh_host='localhost',
+                                   ssh_port=22,
+                                   ssh_user='root')
+        with mock.patch.object(client._runner, 'run') as mock_run:
+            mock_run.return_value = (0, ' 72\n', '')
+            assert client.get_job_cpus_per_task('123') == 72
+
+        mock_run.assert_called_once_with(
+            'squeue -h --jobs 123 --Format=cpus-per-task',
+            require_outputs=True,
+            separate_stderr=True,
+            stream_logs=False,
+        )
+
     def test_get_jobs_info_by_name(self):
         client = slurm.SlurmClient(ssh_host='localhost',
                                    ssh_port=22,

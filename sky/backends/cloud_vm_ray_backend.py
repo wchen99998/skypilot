@@ -289,6 +289,18 @@ def _is_retryable_slurm_ssh_error(error: BaseException) -> bool:
     return False
 
 
+def _pause_on_slurm_ssh_failure(handle: 'CloudVmRayResourceHandle',
+                                returncode: int) -> None:
+    if (returncode == 255 and
+            isinstance(handle.launched_resources.cloud, clouds.Slurm)):
+        raise exceptions.ExecutionPausedError(
+            'Lost SSH access to the Slurm login node while finalizing cluster '
+            'setup.',
+            hint=('Refresh the Slurm SSH credentials. SkyPilot will retry '
+                  'without releasing or resubmitting the allocation.'),
+            retry_wait_seconds=_SLURM_SSH_RETRY_WAIT_SECONDS)
+
+
 def _is_message_too_long(returncode: int,
                          output: Optional[str] = None,
                          file_path: Optional[str] = None) -> bool:
@@ -3807,6 +3819,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     cmd = job_lib.JobLibCodeGen.update_status()
                     returncode, _, stderr = self.run_on_head(
                         handle, cmd, require_outputs=True)
+                    _pause_on_slurm_ssh_failure(handle, returncode)
                     subprocess_utils.handle_returncode(
                         returncode, cmd, 'Failed to update job status.', stderr)
         if (prev_cluster_status == status_lib.ClusterStatus.STOPPED and
@@ -3833,6 +3846,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 cmd = job_lib.JobLibCodeGen.fail_all_jobs_in_progress()
                 returncode, stdout, stderr = self.run_on_head(
                     handle, cmd, require_outputs=True)
+                _pause_on_slurm_ssh_failure(handle, returncode)
                 subprocess_utils.handle_returncode(
                     returncode, cmd,
                     'Failed to set previously in-progress jobs to FAILED',

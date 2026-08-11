@@ -331,6 +331,29 @@ class SlurmClient:
         job_infos = self._parse_job_infos(stdout)
         return job_infos[0] if job_infos else None
 
+    def get_job_cpus_per_task(self, job_id: str) -> int:
+        """Get the CPUs allocated to each task in a Slurm job."""
+        cmd = (f'squeue -h --jobs {shlex.quote(job_id)} '
+               '--Format=cpus-per-task')
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        subprocess_utils.handle_returncode(
+            rc,
+            cmd,
+            f'Failed to get CPUs per task for job {job_id}.',
+            stderr=f'{stdout}\n{stderr}',
+            stream_logs=False)
+        try:
+            cpus_per_task = int(stdout.strip())
+        except ValueError as e:
+            raise RuntimeError(
+                f'Unexpected CPUs per task for Slurm job {job_id}: '
+                f'{stdout!r}') from e
+        if cpus_per_task < 1:
+            raise RuntimeError(
+                f'Unexpected CPUs per task for Slurm job {job_id}: '
+                f'{cpus_per_task}')
+        return cpus_per_task
+
     def get_jobs_info_by_name(self,
                               job_name: str,
                               all_states: bool = False) -> List[JobInfo]:

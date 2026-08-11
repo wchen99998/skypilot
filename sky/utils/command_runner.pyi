@@ -431,6 +431,7 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
     skypilot_runtime_dir: str
     job_id: str
     slurm_node: str
+    cpus_per_task: int
     container_args: Optional[str]
 
     def __init__(
@@ -443,6 +444,7 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
         skypilot_runtime_dir: str,
         job_id: str,
         slurm_node: str,
+        cpus_per_task: int,
         container_args: Optional[str] = ...,
         slurm_user: Optional[str] = ...,
         **kwargs,

@@ -37,6 +37,16 @@ def test_command_length_accounts_for_slurm_user_quoting():
         handle) == 3
 
 
+def test_pause_on_slurm_ssh_failure():
+    handle = MagicMock()
+    handle.launched_resources.cloud = clouds.Slurm()
+
+    with pytest.raises(exceptions.ExecutionPausedError):
+        cloud_vm_ray_backend._pause_on_slurm_ssh_failure(handle, 255)
+
+    cloud_vm_ray_backend._pause_on_slurm_ssh_failure(handle, 1)
+
+
 class TestCloudVmRayBackendTaskRedaction:
     """Tests for CloudVmRayBackend usage of redacted task configs."""
 

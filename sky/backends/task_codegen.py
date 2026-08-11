@@ -1022,7 +1022,7 @@ class SlurmCodeGen(TaskCodeGen):
 
                     # --overlap as we have already secured allocation with the srun for the run section,
                     # and otherwise this srun would get blocked and deadlock.
-                    setup_flags = f'--overlap --nodes={self._setup_num_nodes}'
+                    setup_flags = f'--overlap --nodes={self._setup_num_nodes} --cpus-per-task={task_cpu_demand}'
                     setup_srun, setup_cleanup = build_task_runner_cmd(
                         {self._setup_cmd!r}, setup_flags, {self._setup_log_dir!r}, {self._setup_envs!r},
                         is_setup=True

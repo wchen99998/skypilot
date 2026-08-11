@@ -641,7 +641,7 @@ if script or True:
 
         # --overlap as we have already secured allocation with the srun for the run section,
         # and otherwise this srun would get blocked and deadlock.
-        setup_flags = f'--overlap --nodes=1'
+        setup_flags = f'--overlap --nodes=1 --cpus-per-task=4'
         setup_srun, setup_cleanup = build_task_runner_cmd(
             'pip install torch', setup_flags, '/sky/logs', {'SKYPILOT_TASK_ID': 'sky-2024-11-17-00-00-00-000001-cluster-2', 'MODEL_NAME': 'resnet50', 'SKYPILOT_NUM_NODES': '1'},
             is_setup=True

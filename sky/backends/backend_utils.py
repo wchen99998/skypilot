@@ -796,6 +796,24 @@ def _maybe_add_gcp_service_account_credential_cleanup(
         _GCP_SERVICE_ACCOUNT_CREDENTIAL_CLEANUP_COMMAND)
 
 
+def _get_cluster_credential_file_mounts(
+        cloud: clouds.Cloud,
+        excluded_clouds: Set[clouds.Cloud]) -> Dict[str, str]:
+    if isinstance(cloud, clouds.Slurm):
+        # Slurm jobs run on an existing HPC system reached through the local
+        # SSH configuration. They must not receive unrelated compute,
+        # object-storage, model-registry, or logging credentials.
+        return {}
+
+    credentials = sky_check.get_cloud_credential_file_mounts(excluded_clouds)
+    logging_agent = logs.get_logging_agent()
+    if logging_agent:
+        for k, v in logging_agent.get_credential_file_mounts().items():
+            assert k not in credentials, f'{k} already in credentials'
+            credentials[k] = v
+    return credentials
+
+
 # TODO: too many things happening here - leaky abstraction. Refactor.
 @timeline.event
 def write_cluster_config(
@@ -957,13 +975,7 @@ def write_cluster_config(
                     schemas.RemoteIdentityOptions.NO_UPLOAD.value):
                 excluded_clouds.add(cloud_obj)
 
-    credentials = sky_check.get_cloud_credential_file_mounts(excluded_clouds)
-
-    logging_agent = logs.get_logging_agent()
-    if logging_agent:
-        for k, v in logging_agent.get_credential_file_mounts().items():
-            assert k not in credentials, f'{k} already in credentials'
-            credentials[k] = v
+    credentials = _get_cluster_credential_file_mounts(cloud, excluded_clouds)
 
     private_key_path, _ = auth_utils.get_or_generate_keys()
     auth_config = {'ssh_private_key': private_key_path}
@@ -3649,7 +3661,8 @@ def check_cluster_available(
                 cluster_status=cluster_status,
                 handle=handle)
 
-    if handle.head_ip is None:
+    cloud = handle.launched_resources.cloud
+    if handle.head_ip is None and not isinstance(cloud, clouds.Slurm):
         with ux_utils.print_exception_no_traceback():
             raise exceptions.ClusterNotUpError(
                 f'Cluster {cluster_name!r} has been stopped or not properly '

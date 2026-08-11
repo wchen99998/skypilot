@@ -79,6 +79,7 @@ _SSH_AUTH_FAILURE_PATTERNS = [
     'Permission denied',
     # https://github.com/openssh/openssh-portable/blob/master/sshconnect2.c#L479
     'Authentication failed',
+    'Too many authentication failures',
 ]
 
 
@@ -2032,6 +2033,7 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
         skypilot_runtime_dir: str,
         job_id: str,
         slurm_node: str,
+        cpus_per_task: int,
         container_args: Optional[str],
         slurm_user: Optional[str] = None,
         **kwargs,
@@ -2046,7 +2048,8 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
                 sky_dir=sky_dir,
                 skypilot_runtime_dir=skypilot_runtime_dir,
                 job_id=job_id,
-                slurm_node=slurm_node)
+                slurm_node=slurm_node,
+                cpus_per_task=cpus_per_task)
             runner.run('ls -l', mode=SshMode.NON_INTERACTIVE)
             runner.rsync(source, target, up=True)
 
@@ -2062,6 +2065,7 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
             job_id: The Slurm job ID for this instance.
             slurm_node: The Slurm node hostname for this instance
               (compute node).
+            cpus_per_task: CPUs allocated per task in the Slurm job.
             slurm_user: Unix user that owns the Slurm allocation. None runs
               login-node commands as the SSH user.
             **kwargs: Additional arguments forwarded to SSHCommandRunner
@@ -2076,6 +2080,7 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
         self.skypilot_runtime_dir = skypilot_runtime_dir
         self.job_id = job_id
         self.slurm_node = slurm_node
+        self.cpus_per_task = cpus_per_task
         self.container_args = container_args
 
     def _rsync_via_srun(
@@ -2207,7 +2212,8 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
         srun_cmd = (
             f'srun --unbuffered --quiet --overlap --jobid={self.job_id} '
             f'--nodelist={self.slurm_node} '
-            f'--nodes=1 --ntasks=1 {extra_srun_args}'
+            f'--nodes=1 --ntasks=1 --cpus-per-task={self.cpus_per_task} '
+            f'{extra_srun_args}'
             f'bash -c {shlex.quote(inner_cmd)}')
 
         return SlurmLoginNodeCommandRunner.run(self, srun_cmd, **kwargs)

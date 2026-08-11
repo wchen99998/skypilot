@@ -240,6 +240,15 @@ def _wait_for_job_nodes(
     while True:
         try:
             job_info = client.get_job_info(job_id, deadline=deadline)
+        except exceptions.CommandError as e:
+            if e.returncode != 255:
+                raise
+            raise exceptions.ExecutionPausedError(
+                f'Lost the SSH connection while waiting for Slurm job '
+                f'{job_id}.',
+                hint=('Refresh the Slurm SSH credentials. SkyPilot will retry '
+                      'without releasing or resubmitting the allocation.'),
+                retry_wait_seconds=max(1, client.poll_interval)) from e
         except TimeoutError:
             if deadline is not None:
                 time.sleep(max(0, deadline - time.monotonic()))
@@ -322,7 +331,17 @@ def _wait_for_job_ready(
         if rc == 0:
             return
 
-        job_info = client.get_job_info(job_id)
+        try:
+            job_info = client.get_job_info(job_id)
+        except exceptions.CommandError as e:
+            if e.returncode != 255:
+                raise
+            raise exceptions.ExecutionPausedError(
+                f'Lost the SSH connection while initializing Slurm job '
+                f'{job_id}.',
+                hint=('Refresh the Slurm SSH credentials. SkyPilot will retry '
+                      'without releasing or resubmitting the allocation.'),
+                retry_wait_seconds=max(1, client.poll_interval)) from e
         job_state = None if job_info is None else job_info.state
         # Job states that indicate the job is still initializing
         # See: https://slurm.schedmd.com/squeue.html#SECTION_JOB-STATE-CODES
@@ -916,11 +935,35 @@ def query_instances(
     statuses: Dict[str, Tuple[Optional[status_lib.ClusterStatus],
                               Optional[str]]] = {}
     jobs = client.get_jobs_info_by_name(cluster_name_on_cloud, all_states=True)
+    running_jobs = [job for job in jobs if job.state.lower() == 'running']
+    runtime_ready = True
+    if running_jobs:
+        slurm_cluster = slurm_utils.get_slurm_cluster_from_config(
+            provider_config)
+        workdir = skypilot_config.get_effective_region_config(
+            cloud='slurm',
+            region=slurm_cluster,
+            keys=('workdir',),
+            default_value=None)
+        if workdir is None:
+            sky_base_dir = client.get_remote_home_dir()
+        else:
+            sky_base_dir = slurm_utils.expand_path_vars(workdir,
+                                                        client.get_env())
+        skylet_start_file = (
+            f'{_sky_cluster_home_dir(sky_base_dir, cluster_name_on_cloud)}'
+            '/.sky/skylet_start.sh')
+        runtime_ready = client.check_file_exists(skylet_start_file)
+
     for job in jobs:
         state = job.state.lower()
         if state not in status_map:
             continue
         sky_status = status_map[state]
+        reason = None
+        if state == 'running' and not runtime_ready:
+            sky_status = status_lib.ClusterStatus.INIT
+            reason = 'SkyPilot runtime setup incomplete'
         if state in ('pending', 'configuring', 'failed', 'node_fail',
                      'cancelled', 'completed'):
             if non_terminated_only and sky_status is None:
@@ -933,7 +976,7 @@ def query_instances(
         elif job.nodelist is not None:
             for node in slurm.hostlist.expand_hostlist(job.nodelist):
                 instance_id = slurm_utils.instance_id(job.job_id, node)
-                statuses[instance_id] = (sky_status, None)
+                statuses[instance_id] = (sky_status, reason)
 
     # TODO(kevin): Query sacct too to get more historical job info.
     # squeue only includes completed jobs that finished in the last
@@ -1321,6 +1364,7 @@ def get_command_runners(
     has_container = client.check_file_exists(container_marker)
     container_args = _build_pyxis_args(
         cluster_name_on_cloud) if has_container else None
+    cpus_per_task = client.get_job_cpus_per_task(head_instance.tags['job_id'])
 
     runners = [
         # Note: For Slurm, the external IP for all instances is the same,
@@ -1334,6 +1378,7 @@ def get_command_runners(
                                                        cluster_name_on_cloud),
             job_id=instance_info.tags['job_id'],
             slurm_node=instance_info.tags['node'],
+            cpus_per_task=cpus_per_task,
             ssh_proxy_jump=login_node_ssh_proxy_jump,
             ssh_proxy_command=login_node_ssh_proxy_command,
             ssh_control_name=ssh_control_name,

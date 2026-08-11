@@ -5,6 +5,7 @@ import pytest
 
 from sky import exceptions
 from sky.provision.slurm import instance
+from sky.utils import status_lib
 
 _CLUSTER = 'test-cluster'
 _PROVIDER_CONFIG = {
@@ -203,3 +204,63 @@ class TestWaitForJobStates:
             255, 'squeue', 'ssh dropped', None)
         assert not instance._wait_for_job_states(
             client, 'job', instance._EXITING_JOB_STATES, timeout=0)
+
+
+def test_wait_for_job_nodes_pauses_on_ssh_failure():
+    client = mock.MagicMock(poll_interval=60)
+    client.get_job_info.side_effect = exceptions.CommandError(
+        255, 'squeue', 'ssh dropped', None)
+
+    with pytest.raises(exceptions.ExecutionPausedError,
+                       match='waiting for Slurm job') as exc_info:
+        instance._wait_for_job_nodes(client, '123', -1, 'workq', mock.Mock())
+
+    assert 'without releasing' in exc_info.value.hint
+
+
+def test_wait_for_job_ready_pauses_on_ssh_failure():
+    runner = mock.MagicMock()
+    runner.run.return_value = (1, '', '')
+    client = mock.MagicMock(poll_interval=60)
+    client.get_job_info.side_effect = exceptions.CommandError(
+        255, 'squeue', 'ssh dropped', None)
+
+    with pytest.raises(exceptions.ExecutionPausedError,
+                       match='initializing Slurm job'):
+        instance._wait_for_job_ready(runner, client, '123', '/ready',
+                                     '/slurm.log')
+
+
+@pytest.mark.parametrize(
+    'runtime_ready,expected_status',
+    [(False, status_lib.ClusterStatus.INIT),
+     (True, status_lib.ClusterStatus.UP)],
+)
+def test_query_instances_requires_runtime_marker(monkeypatch, runtime_ready,
+                                                 expected_status):
+    client = mock.MagicMock()
+    client.get_jobs_info_by_name.return_value = [
+        instance.slurm.JobInfo('123', 'RUNNING', 'node1', None)
+    ]
+    client.get_remote_home_dir.return_value = '/home/testuser'
+    client.check_file_exists.return_value = runtime_ready
+    monkeypatch.setattr(instance.slurm, 'SlurmClient',
+                        mock.MagicMock(return_value=client))
+    monkeypatch.setattr(instance.skypilot_config, 'get_effective_region_config',
+                        mock.MagicMock(return_value=None))
+    provider_config = {
+        **_PROVIDER_CONFIG,
+        'poll_interval': 0,
+    }
+
+    statuses = instance.query_instances('display-name',
+                                        'cluster-on-cloud',
+                                        provider_config=provider_config)
+
+    reason = None if runtime_ready else 'SkyPilot runtime setup incomplete'
+    assert statuses == {
+        'job123-node1': (expected_status, reason),
+    }
+    client.check_file_exists.assert_called_once_with(
+        '/home/testuser/.sky_clusters/cluster-on-cloud/'
+        '.sky/skylet_start.sh')

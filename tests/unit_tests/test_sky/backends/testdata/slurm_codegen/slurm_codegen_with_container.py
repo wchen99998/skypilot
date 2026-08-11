@@ -639,7 +639,7 @@ if script or False:
 
         # --overlap as we have already secured allocation with the srun for the run section,
         # and otherwise this srun would get blocked and deadlock.
-        setup_flags = f'--overlap --nodes=None'
+        setup_flags = f'--overlap --nodes=None --cpus-per-task=1'
         setup_srun, setup_cleanup = build_task_runner_cmd(
             None, setup_flags, None, None,
             is_setup=True

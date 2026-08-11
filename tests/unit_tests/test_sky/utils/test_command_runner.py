@@ -373,6 +373,7 @@ class TestSlurmCommandRunnerUserImpersonation:
             skypilot_runtime_dir='/tmp/test',
             job_id='123',
             slurm_node='node-1',
+            cpus_per_task=72,
             container_args=None,
             slurm_user=slurm_user)
 
@@ -465,6 +466,7 @@ class TestSlurmCommandRunnerUserImpersonation:
         ]
         assert remote_command[9:] == ['--', 'alice']
         assert remote_command[8].startswith('srun --unbuffered')
+        assert '--cpus-per-task=72' in remote_command[8]
         assert 'whoami' in remote_command[8]
 
     def test_srun_rsync_as_user(self):
@@ -605,6 +607,7 @@ class TestSSHCommandRunnerAuthFailureDetection:
             # Auth failures that should trigger retry (rc=255 + auth pattern):
             (255, 'Permission denied (keyboard-interactive).', True),
             (255, 'Authentication failed.', True),
+            (255, 'Too many authentication failures', True),
             # Cases that should NOT trigger retry:
             # - rc=255 but no auth pattern in log
             (255, 'Connection timed out', False),

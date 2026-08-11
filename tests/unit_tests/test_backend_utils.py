@@ -239,6 +239,17 @@ def test_gcp_service_account_credential_cleanup_rejects_environment_override(
                        text=True)
 
 
+@mock.patch('sky.backends.backend_utils.logs.get_logging_agent')
+@mock.patch(
+    'sky.backends.backend_utils.sky_check.get_cloud_credential_file_mounts')
+def test_slurm_uploads_no_cloud_or_logging_credentials(mock_cloud_credentials,
+                                                       mock_logging_agent):
+    assert backend_utils._get_cluster_credential_file_mounts(
+        clouds.Slurm(), set()) == {}
+    mock_cloud_credentials.assert_not_called()
+    mock_logging_agent.assert_not_called()
+
+
 # Set env var to test config file.
 @mock.patch.object(skypilot_config, '_global_config_context',
                    skypilot_config.ConfigContext())
@@ -613,6 +624,24 @@ def test_check_cluster_available_rejects_init(mock_refresh, mock_get_backend):
         assert False, 'Expected ClusterNotUpError to be raised'
     except ClusterNotUpError:
         pass
+
+
+@mock.patch('sky.backends.backend_utils.get_backend_from_handle')
+@mock.patch('sky.backends.backend_utils.refresh_cluster_status_handle')
+def test_check_cluster_available_accepts_slurm_without_head_ip(
+        mock_refresh, mock_get_backend):
+    mock_handle = mock.MagicMock()
+    mock_handle.head_ip = None
+    mock_handle.launched_resources.cloud = clouds.Slurm()
+    mock_refresh.return_value = (status_lib.ClusterStatus.UP, mock_handle)
+    mock_get_backend.return_value = mock.MagicMock()
+
+    result = backend_utils.check_cluster_available(
+        'test-cluster',
+        operation='test_operation',
+        check_cloud_vm_ray_backend=False)
+
+    assert result == mock_handle
 
 
 def _k8s_owner_check_record(owner_identity):
