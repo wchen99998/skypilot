@@ -6,6 +6,7 @@ from google.auth import exceptions as google_auth_exceptions
 import pytest
 
 from sky.provision.gcp import constants
+from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils
 from sky.provision.gcp import mig_utils
 
@@ -366,3 +367,49 @@ def test_cleanup_accepts_delete_error_after_absence_is_verified(monkeypatch):
         'project', 'us-east5', 'cluster'))
 
     assert not deleted
+
+
+@pytest.mark.parametrize('provider_config,present,expect_delete', [
+    ({
+        '_is_tpu_mig': True
+    }, ['regional MIG'], True),
+    ({
+        '_is_tpu_mig': True
+    }, [], False),
+    ({
+        '_is_tpu_mig': False
+    }, ['regional MIG'], False),
+    ({}, ['regional MIG'], False),
+])
+def test_cleanup_cluster_resources_deletes_leftover_tpu_mig(
+        monkeypatch, provider_config, present, expect_delete):
+    provider_config = dict(provider_config,
+                           project_id='project',
+                           availability_zone='us-east5-b')
+    presence_calls = []
+    deletes = []
+
+    def resources_present(cls, *args):
+        del cls
+        presence_calls.append(args)
+        return present
+
+    def delete(cls, *args):
+        del cls
+        deletes.append(args)
+        return True
+
+    monkeypatch.setattr(instance_utils.GCPManagedInstanceGroup,
+                        'tpu_mig_resources_present',
+                        classmethod(resources_present))
+    monkeypatch.setattr(instance_utils.GCPManagedInstanceGroup,
+                        'delete_tpu_mig_resources', classmethod(delete))
+
+    gcp_instance.cleanup_cluster_resources('cluster', provider_config)
+
+    if provider_config.get('_is_tpu_mig'):
+        assert presence_calls == [('project', 'us-east5', 'cluster')]
+    else:
+        assert not presence_calls
+    assert deletes == ([('project', 'us-east5',
+                         'cluster')] if expect_delete else [])

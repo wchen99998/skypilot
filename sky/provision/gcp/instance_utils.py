@@ -1580,6 +1580,12 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                 min(cls._TPU_MIG_CLEANUP_POLL_INTERVAL_SECONDS, remaining))
 
     @classmethod
+    def tpu_mig_resources_present(cls, project_id: str, region: str,
+                                  cluster_name: str) -> List[str]:
+        """Return named TPU MIG resources that are still visible."""
+        return cls._tpu_mig_resources_present(project_id, region, cluster_name)
+
+    @classmethod
     def delete_tpu_mig_resources(cls, project_id: str, region: str,
                                  cluster_name: str) -> bool:
         """Delete and reconcile regional TPU MIG resources for a cluster."""

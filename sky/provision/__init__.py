@@ -381,8 +381,8 @@ def cleanup_cluster_resources(
     """Cleanup all cloud resources for a cluster (services, etc.).
 
     Called during post-teardown to ensure resources are cleaned up even when
-    instances were deleted externally. Currently only Kubernetes needs this
-    to clean up orphaned services.
+    instances were deleted externally. Kubernetes uses this to clean up
+    orphaned services, and GCP to delete TPU MIGs still queued for capacity.
 
     Args:
         provider_name: Name of the cloud provider

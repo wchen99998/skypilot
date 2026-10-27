@@ -1517,17 +1517,20 @@ required for Spot TPU MIGs, but Spot provisioning ignores the duration.
 ``provision_timeout``: Timeout for provisioning an instance by DWS (in seconds, optional).
 This timeout determines how long SkyPilot will wait for a managed instance
 group to create the requested resources before giving up and deleting the MIG.
-For a non-Spot Compute TPU request with no region or zone constraint, SkyPilot
-submits DWS Flex-start MIG requests in every eligible configured region in
-parallel. The first region to acquire the full TPU slice wins; SkyPilot cancels
-and deletes every other regional MIG before continuing cluster setup. An
-explicit region or zone keeps a single request in that location. Other MIG
-types retain sequential location failover.
-Within each region, SkyPilot submits one regional bulk TPU MIG request and keeps
-that request queued for the full timeout. Google Cloud retries the request as
-capacity becomes available, so this value can be longer than two hours without
-resubmitting or losing queue position. The two-hour request-validity limit for
-standalone zonal Flex-start VMs does not apply to bulk TPU MIGs.
+For a non-Spot Compute TPU request with no zone constraint, SkyPilot submits
+DWS Flex-start MIG requests in every eligible zone in parallel: every configured
+region's Flex-start zones, or only the requested region's zones when a region
+is set. The first zone to acquire the full TPU slice wins; SkyPilot cancels and
+deletes every other zone's MIG before continuing cluster setup. An explicit zone
+keeps a single request in that zone. Tearing the cluster down also deletes any
+MIG left queued in another zone, for example after the API server restarted
+mid-launch. Other MIG types retain sequential location failover.
+In each zone, SkyPilot submits one regional bulk TPU MIG request pinned to that
+zone and keeps that request queued for the full timeout. Google Cloud retries
+the request as capacity becomes available, so this value can be longer than
+two hours without resubmitting or losing queue position. The two-hour
+request-validity limit for standalone zonal Flex-start VMs does not apply to
+bulk TPU MIGs.
 See Google Cloud's `TPU Flex-start documentation
 <https://docs.cloud.google.com/tpu/docs/create-flex-start-compute>`_ and
 `bulk MIG documentation

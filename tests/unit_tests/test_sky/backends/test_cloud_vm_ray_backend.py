@@ -582,8 +582,8 @@ class TestCloudVmRayBackendGetGrpcChannel:
         assert backend._get_num_gpus(test_task) == 8
 
 
-class TestTpuFlexStartMultiRegionProvisioning:
-    """Tests parallel TPU MIG DWS Flex-start region provisioning."""
+class TestTpuFlexStartMultiZoneProvisioning:
+    """Tests parallel TPU MIG DWS Flex-start zone provisioning."""
 
     @staticmethod
     def _provisioner():
@@ -616,11 +616,7 @@ class TestTpuFlexStartMultiRegionProvisioning:
                                        }
                                    })
 
-    def test_candidates_span_regions_only_for_unpinned_flex_start(self):
-        provisioner = self._provisioner()
-        requested = self._resources()
-        launch_task = task.Task(resources=requested, num_nodes=4)
-        selected = requested.copy(region='us-east5', zone='us-east5-b')
+    def _candidates(self, provisioner, launch_task, selected):
         regions = [
             clouds.Region('us-east5').set_zones([
                 clouds.Zone('us-east5-a'),
@@ -631,61 +627,89 @@ class TestTpuFlexStartMultiRegionProvisioning:
             clouds.Region('europe-west4').set_zones(
                 [clouds.Zone('europe-west4-a')]),
         ]
-
         with patch.object(resources.Resources,
                           'get_valid_regions_for_launchable',
                           return_value=regions), patch.object(
                               cloud_vm_ray_backend.skypilot_config,
                               'get_effective_region_config',
                               return_value={'run_duration': 3600}):
-            candidates = provisioner._get_tpu_flex_start_region_candidates(
+            candidates = provisioner._get_tpu_flex_start_candidates(
                 launch_task, selected)
+        return [(candidate.region, candidate.zone) for candidate in candidates]
 
-        assert [(candidate.region, candidate.zone) for candidate in candidates
-               ] == [
-                   ('us-east5', 'us-east5-b'),
-                   ('us-central1', 'us-central1-a'),
-                   ('europe-west4', 'europe-west4-a'),
-               ]
+    def test_unpinned_request_races_every_flex_start_zone(self):
+        provisioner = self._provisioner()
+        launch_task = task.Task(resources=self._resources(), num_nodes=4)
+        selected = self._resources(region='us-east5', zone='us-east5-b')
 
-        pinned_task = task.Task(resources=self._resources(region='us-east5',
+        assert self._candidates(provisioner, launch_task, selected) == [
+            ('us-east5', 'us-east5-b'),
+            ('us-east5', 'us-east5-a'),
+            ('us-central1', 'us-central1-a'),
+            ('europe-west4', 'europe-west4-a'),
+        ]
+
+    def test_region_pinned_request_races_that_regions_zones(self):
+        provisioner = self._provisioner()
+        launch_task = task.Task(resources=self._resources(region='us-east5'),
+                                num_nodes=4)
+        selected = self._resources(region='us-east5', zone='us-east5-a')
+
+        assert self._candidates(provisioner, launch_task, selected) == [
+            ('us-east5', 'us-east5-a'),
+            ('us-east5', 'us-east5-b'),
+        ]
+
+    def test_zone_pinned_request_does_not_race(self):
+        provisioner = self._provisioner()
+        launch_task = task.Task(resources=self._resources(region='us-east5',
                                                           zone='us-east5-a'),
                                 num_nodes=4)
-        assert provisioner._get_tpu_flex_start_region_candidates(
-            pinned_task, selected) == []
+        selected = self._resources(region='us-east5', zone='us-east5-a')
 
-    def test_first_region_wins_and_late_success_is_cleaned_up(self):
+        assert self._candidates(provisioner, launch_task, selected) == []
+
+    def test_first_zone_wins_and_late_success_is_cleaned_up(self):
         provisioner = self._provisioner()
         requested = self._resources()
         launch_task = task.Task(resources=requested, num_nodes=4)
         candidates = [
             requested.copy(region='us-east5', zone='us-east5-a'),
-            requested.copy(region='europe-west4', zone='europe-west4-a'),
+            requested.copy(region='us-east5', zone='us-east5-b'),
         ]
         started = threading.Barrier(len(candidates))
-        cancelled_regions = []
+        cancelled_zones = []
         configs = {}
+        stored_yamls = {}
 
         def retry_zones(self, candidate, *args, cancel_event, **kwargs):
             del self, args
             handle = MagicMock()
-            handle.cluster_name = f'test-mr-{candidate.region}'
-            handle.cluster_name_on_cloud = f'test-{candidate.region}'
+            handle.cluster_name = kwargs['cluster_name']
+            handle.cluster_name_on_cloud = name_on_cloud(kwargs['cluster_name'])
             handle.launched_resources = candidate
-            handle.cluster_yaml = f'/tmp/{candidate.region}.yml'
+            handle.cluster_yaml = f'/tmp/{kwargs["cluster_name"]}.yml'
             config = {'handle': handle, 'provisioning_skipped': False}
-            configs[candidate.region] = config
+            configs[candidate.zone] = config
             kwargs['on_cluster_config_created'](handle)
             started.wait()
-            if candidate.region == 'us-east5':
+            if candidate.zone == 'us-east5-a':
                 return config
             assert cancel_event.wait(timeout=2)
-            cancelled_regions.append(candidate.region)
+            cancelled_zones.append(candidate.zone)
             return config
+
+        def name_on_cloud(name):
+            return cloud_vm_ray_backend.common_utils.make_cluster_name_on_cloud(
+                name, max_length=clouds.GCP.max_cluster_name_length())
+
+        def set_cluster_yaml(name, yaml_str):
+            stored_yamls[name] = cloud_vm_ray_backend.yaml_utils.safe_load(
+                yaml_str)
 
         with patch.object(
                 provisioner,
-                '_get_tpu_flex_start_region_candidates',
+                '_get_tpu_flex_start_candidates',
                 return_value=candidates), patch.object(
                     cloud_vm_ray_backend.RetryingVmProvisioner,
                     '_retry_zones',
@@ -697,17 +721,36 @@ class TestTpuFlexStartMultiRegionProvisioning:
                  provisioner,
                  '_record_cluster_provisioning_state') as record_state, \
              patch.object(cloud_vm_ray_backend.global_user_state,
-                          'add_cluster_event'):
-            result = provisioner._race_tpu_flex_start_regions(
+                          'add_cluster_event'), \
+             patch.object(cloud_vm_ray_backend.global_user_state,
+                          'get_cluster_yaml_dict',
+                          side_effect=lambda path: {'provider': {}}), \
+             patch.object(cloud_vm_ray_backend.global_user_state,
+                          'set_cluster_yaml',
+                          side_effect=set_cluster_yaml):
+            result = provisioner._race_tpu_flex_start_zones(
                 launch_task, candidates[0], 4, False, 'test', ['user'])
 
         assert result is not None
         assert result['handle'].cluster_name == 'test'
-        assert cancelled_regions == ['europe-west4']
-        cleanup.assert_called_once_with(configs['europe-west4'])
+        assert cancelled_zones == ['us-east5-b']
+        cleanup.assert_called_once_with(configs['us-east5-b'])
         assert record_state.call_count == 2
+        # Every candidate's YAML names all racing MIGs before submitting.
+        expected_members = [{
+            'zone': 'us-east5-a',
+            'cluster_name_on_cloud': name_on_cloud('test-mr-us-east5-a'),
+        }, {
+            'zone': 'us-east5-b',
+            'cluster_name_on_cloud': name_on_cloud('test-mr-us-east5-b'),
+        }]
+        assert set(stored_yamls) == {'test-mr-us-east5-a', 'test-mr-us-east5-b'}
+        for config in stored_yamls.values():
+            assert config['provider'][
+                cloud_vm_ray_backend._TPU_FLEX_START_RACE_MEMBERS_KEY] == (
+                    expected_members)
 
-    def test_all_regions_fail_and_are_blocked(self):
+    def test_all_zones_fail_and_are_blocked(self):
         provisioner = self._provisioner()
         requested = self._resources()
         launch_task = task.Task(resources=requested, num_nodes=4)
@@ -717,7 +760,7 @@ class TestTpuFlexStartMultiRegionProvisioning:
         ]
 
         with patch.object(provisioner,
-                          '_get_tpu_flex_start_region_candidates',
+                          '_get_tpu_flex_start_candidates',
                           return_value=candidates), patch.object(
                               cloud_vm_ray_backend.RetryingVmProvisioner,
                               '_retry_zones',
@@ -728,8 +771,9 @@ class TestTpuFlexStartMultiRegionProvisioning:
                                       '_record_cluster_provisioning_state'):
             with pytest.raises(exceptions.ResourcesUnavailableError,
                                match='All parallel TPU Flex-start'):
-                provisioner._race_tpu_flex_start_regions(
-                    launch_task, candidates[0], 4, False, 'test', ['user'])
+                provisioner._race_tpu_flex_start_zones(launch_task,
+                                                       candidates[0], 4, False,
+                                                       'test', ['user'])
 
         assert provisioner._blocked_resources == set(candidates)
 
@@ -739,8 +783,76 @@ class TestTpuFlexStartMultiRegionProvisioning:
         launch_task = task.Task(resources=requested, num_nodes=4)
         selected = requested.copy(region='us-east5', zone='us-east5-a')
 
-        assert provisioner._get_tpu_flex_start_region_candidates(
+        assert provisioner._get_tpu_flex_start_candidates(
             launch_task, selected) == []
+
+    def test_race_member_cleanup_targets_other_zones(self):
+        provider_config = {
+            'project_id': 'proj',
+            'region': 'us-east5',
+            'availability_zone': 'us-east5-a',
+            '_is_tpu_mig': True,
+            cloud_vm_ray_backend._TPU_FLEX_START_RACE_MEMBERS_KEY: [{
+                'zone': 'us-east5-a',
+                'cluster_name_on_cloud': 'own',
+            }, {
+                'zone': 'europe-west4-a',
+                'cluster_name_on_cloud': 'sibling',
+            }],
+        }
+
+        with patch.object(cloud_vm_ray_backend.provision_lib,
+                          'cleanup_cluster_resources') as cleanup:
+            cloud_vm_ray_backend._cleanup_tpu_flex_start_race_members(
+                'GCP', 'own', provider_config)
+
+        cleanup.assert_called_once_with(
+            'GCP', 'sibling', {
+                'project_id': 'proj',
+                'region': 'europe-west4',
+                'availability_zone': 'europe-west4-a',
+                '_is_tpu_mig': True,
+            })
+
+    @pytest.mark.parametrize('failover', [False, True])
+    def test_teardown_sweeps_race_members_only_outside_failover(self, failover):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = MagicMock()
+        handle.cluster_name = 'test'
+        handle.cluster_name_on_cloud = 'test-mr-us-east5-a-cloud'
+        handle.cluster_yaml = '/tmp/test-mr-us-east5-a.yml'
+        handle.launched_resources.is_image_managed = False
+        launchable = MagicMock()
+        # Mock rejects reading attributes named assert_*, so set it directly.
+        handle.launched_resources.assert_launchable = MagicMock(
+            return_value=launchable)
+        cloud = launchable.cloud
+        provider_config = {'availability_zone': 'us-east5-a'}
+
+        with patch.object(cloud_vm_ray_backend, 'provision_lib') as provision, \
+             patch.object(cloud_vm_ray_backend, 'global_user_state') as state, \
+             patch.object(cloud_vm_ray_backend, 'metadata_utils'), \
+             patch.object(cloud_vm_ray_backend, 'cluster_utils'), \
+             patch.object(backend, 'remove_cluster_config'), \
+             patch.object(cloud_vm_ray_backend,
+                          '_cleanup_tpu_flex_start_race_members') as sweep:
+            state.get_cluster_yaml_dict.return_value = {
+                'provider': provider_config
+            }
+            provision.query_instances.return_value = {}
+            backend.post_teardown_cleanup(handle,
+                                          terminate=True,
+                                          remove_from_db=False,
+                                          failover=failover)
+
+        provision.cleanup_cluster_resources.assert_called_once_with(
+            repr(cloud), 'test-mr-us-east5-a-cloud', provider_config)
+        if failover:
+            sweep.assert_not_called()
+        else:
+            sweep.assert_called_once_with(repr(cloud),
+                                          'test-mr-us-east5-a-cloud',
+                                          provider_config)
 
 
 class TestIsMessageTooLong:

@@ -187,6 +187,10 @@ _RSYNC_NOT_FOUND_MESSAGE = (
 
 _TPU_NOT_FOUND_ERROR = 'ERROR: (gcloud.compute.tpus.delete) NOT_FOUND'
 
+# Provider config key listing every zone's MIG submitted by a TPU Flex-start
+# race, as [{'zone': ..., 'cluster_name_on_cloud': ...}].
+_TPU_FLEX_START_RACE_MEMBERS_KEY = '_tpu_flex_start_race_members'
+
 _MAX_RAY_UP_RETRY = 5
 
 # Number of retries for getting zones.
@@ -429,6 +433,41 @@ def _add_to_blocked_resources(blocked_resources: Set['resources_lib.Resources'],
         if resources.should_be_blocked_by(r):
             return
     blocked_resources.add(resources)
+
+
+def _tpu_flex_start_candidate_name(cluster_name: str,
+                                   candidate: 'resources_lib.Resources') -> str:
+    return f'{cluster_name}-mr-{candidate.zone}'
+
+
+def _cleanup_tpu_flex_start_race_members(
+        provider_name: str, cluster_name_on_cloud: str,
+        provider_config: Dict[str, Any]) -> None:
+    """Deletes the MIGs of the other zones a TPU Flex-start race submitted.
+
+    Losing zones delete their own MIGs while the race runs. If the launching
+    process died first, their queued MIGs stay on GCP and can be fulfilled
+    later with nothing tracking them. Call this only when the whole cluster is
+    torn down: a racing candidate's own failover cleanup must not delete its
+    siblings, one of which may be the winner.
+    """
+    members = provider_config.get(_TPU_FLEX_START_RACE_MEMBERS_KEY)
+    if not members:
+        return
+
+    def cleanup_member(member: Dict[str, str]) -> None:
+        member_config = dict(provider_config,
+                             region=member['zone'].rpartition('-')[0],
+                             availability_zone=member['zone'])
+        member_config.pop(_TPU_FLEX_START_RACE_MEMBERS_KEY)
+        provision_lib.cleanup_cluster_resources(provider_name,
+                                                member['cluster_name_on_cloud'],
+                                                member_config)
+
+    subprocess_utils.run_in_parallel(cleanup_member, [
+        member for member in members
+        if member['cluster_name_on_cloud'] != cluster_name_on_cloud
+    ])
 
 
 class FailoverCloudErrorHandlerV1:
@@ -1069,28 +1108,42 @@ class RetryingVmProvisioner(object):
         global_user_state.set_owner_identity_for_cluster(
             cluster_name, cloud_user_identity)
 
-    def _get_tpu_flex_start_region_candidates(
+    def _get_tpu_flex_start_candidates(
         self,
         task: task_lib.Task,
         to_provision: resources_lib.Resources,
     ) -> List[resources_lib.Resources]:
+        """Returns one candidate per Flex-start zone to race in parallel.
+
+        Each zone gets its own MIG pinned to that zone, so the zone recorded
+        for the cluster stays exact. A request without a region races every
+        eligible zone; a request pinned to a region races that region's zones.
+        """
         if (not isinstance(to_provision.cloud, clouds.GCP) or
                 to_provision.use_spot or to_provision.instance_type is None or
                 not to_provision.instance_type.startswith(
                     ('ct6e-standard-', 'tpu7x-standard-'))):
             return []
 
-        request_allows_multiple_regions = any(
-            requested.region is None and requested.zone is None and
-            (requested.cloud is None or isinstance(requested.cloud, clouds.GCP)
-            ) and requested.instance_type == to_provision.instance_type
-            for requested in task.resources)
-        if not request_allows_multiple_regions:
+        requested_regions = [
+            requested.region
+            for requested in task.resources
+            if requested.zone is None and
+            requested.instance_type == to_provision.instance_type and
+            (requested.cloud is None or isinstance(requested.cloud, clouds.GCP))
+        ]
+        if not requested_regions:
             return []
+        # None means any region.
+        allowed_regions = (None if None in requested_regions else
+                           set(requested_regions))
 
         unrestricted = to_provision.copy(region=None, zone=None)
         candidates = []
         for region in unrestricted.get_valid_regions_for_launchable():
+            if (allowed_regions is not None and
+                    region.name not in allowed_regions):
+                continue
             mig_config = skypilot_config.get_effective_region_config(
                 cloud='gcp',
                 region=region.name,
@@ -1100,18 +1153,18 @@ class RetryingVmProvisioner(object):
             if mig_config is None:
                 continue
             assert region.zones is not None and region.zones, region
-            zone = region.zones[0].name
-            if (region.name == to_provision.region and
-                    to_provision.zone is not None):
-                zone = to_provision.zone
-            candidate = unrestricted.copy(region=region.name, zone=zone)
-            if any(
-                    candidate.should_be_blocked_by(blocked)
-                    for blocked in self._blocked_resources):
-                continue
-            candidates.append(candidate)
-        candidates.sort(
-            key=lambda candidate: candidate.region != to_provision.region)
+            for zone in region.zones:
+                candidate = unrestricted.copy(region=region.name,
+                                              zone=zone.name)
+                if any(
+                        candidate.should_be_blocked_by(blocked)
+                        for blocked in self._blocked_resources):
+                    continue
+                candidates.append(candidate)
+        candidates.sort(key=lambda candidate: (
+            candidate.region != to_provision.region,
+            candidate.zone != to_provision.zone,
+        ))
         return candidates
 
     @staticmethod
@@ -1129,7 +1182,7 @@ class RetryingVmProvisioner(object):
                                                   remove_from_db=False,
                                                   failover=True)
 
-    def _race_tpu_flex_start_regions(
+    def _race_tpu_flex_start_zones(
         self,
         task: task_lib.Task,
         to_provision: resources_lib.Resources,
@@ -1138,16 +1191,23 @@ class RetryingVmProvisioner(object):
         cluster_name: str,
         cloud_user_identity: Optional[List[str]],
     ) -> Optional[Dict[str, Any]]:
-        candidates = self._get_tpu_flex_start_region_candidates(
-            task, to_provision)
+        candidates = self._get_tpu_flex_start_candidates(task, to_provision)
         if len(candidates) < 2:
             return None
 
-        regions = ', '.join(
-            typing.cast(str, candidate.region) for candidate in candidates)
+        zones = ', '.join(
+            typing.cast(str, candidate.zone) for candidate in candidates)
         logger.info(
             'Launching TPU Flex-start requests in parallel across %d '
-            'regions: %s', len(candidates), regions)
+            'zones: %s', len(candidates), zones)
+        assert to_provision.cloud is not None
+        max_name_length = to_provision.cloud.max_cluster_name_length()
+        race_members = [{
+            'zone': candidate.zone,
+            'cluster_name_on_cloud': common_utils.make_cluster_name_on_cloud(
+                _tpu_flex_start_candidate_name(cluster_name, candidate),
+                max_length=max_name_length),
+        } for candidate in candidates]
         cancel_event = threading.Event()
         requested_resources = set(task.resources)
         state_lock = threading.Lock()
@@ -1177,12 +1237,33 @@ class RetryingVmProvisioner(object):
                     provision_log_path, task, cloud_user_identity)
                 state_recorded = True
 
+        def on_candidate_config_created(
+                handle: 'CloudVmRayResourceHandle') -> None:
+            # Runs before this candidate submits its MIG. Whichever candidate
+            # gets recorded, its YAML then names every racing MIG, so tearing
+            # the cluster down sweeps them all even if this process dies
+            # mid-race.
+            members = [
+                dict(member, cluster_name_on_cloud=handle.cluster_name_on_cloud)
+                if member['zone'] == handle.launched_resources.zone else member
+                for member in race_members
+            ]
+            assert handle.cluster_yaml is not None
+            config = global_user_state.get_cluster_yaml_dict(
+                handle.cluster_yaml)
+            config['provider'][_TPU_FLEX_START_RACE_MEMBERS_KEY] = members
+            global_user_state.set_cluster_yaml(
+                os.path.splitext(os.path.basename(handle.cluster_yaml))[0],
+                yaml_utils.dump_yaml_str(config))
+            record_candidate_state(handle)
+
         def provision_candidate(
                 candidate: resources_lib.Resources) -> Dict[str, Any]:
-            assert candidate.region is not None
-            candidate_name = f'{cluster_name}-mr-{candidate.region}'
-            candidate_log_dir = os.path.join(self.log_dir, 'regions',
-                                             candidate.region)
+            assert candidate.zone is not None
+            candidate_name = _tpu_flex_start_candidate_name(
+                cluster_name, candidate)
+            candidate_log_dir = os.path.join(self.log_dir, 'zones',
+                                             candidate.zone)
             candidate_provisioner = RetryingVmProvisioner(
                 candidate_log_dir,
                 self._dag,
@@ -1211,7 +1292,7 @@ class RetryingVmProvisioner(object):
                 task=task,
                 record_cluster_state=False,
                 cancel_event=cancel_event,
-                on_cluster_config_created=record_candidate_state)
+                on_cluster_config_created=on_candidate_config_created)
             config_dict['_provision_log_path'] = os.path.abspath(
                 os.path.join(candidate_log_dir, 'provision.log'))
             return config_dict
@@ -1243,7 +1324,7 @@ class RetryingVmProvisioner(object):
                     cancel_event.set()
                     logger.info(
                         'TPU Flex-start capacity acquired in %s; '
-                        'cancelling all other regions.', candidate.region)
+                        'cancelling all other zones.', candidate.zone)
                 else:
                     try:
                         self._cleanup_tpu_flex_start_candidate(config_dict)
@@ -1263,7 +1344,7 @@ class RetryingVmProvisioner(object):
                 common_utils.format_exception(error)
                 for error in cleanup_errors)
             raise provision_common.StopFailoverError(
-                'Failed to clean up one or more TPU Flex-start region '
+                'Failed to clean up one or more TPU Flex-start zone '
                 f'candidates: {details}')
 
         if winner is None:
@@ -1271,8 +1352,7 @@ class RetryingVmProvisioner(object):
                 _add_to_blocked_resources(self._blocked_resources, candidate)
             blocks = _format_provision_failure_blocks(candidate_errors)
             raise exceptions.ResourcesUnavailableError(
-                'All parallel TPU Flex-start region requests failed.\n' +
-                blocks)
+                'All parallel TPU Flex-start zone requests failed.\n' + blocks)
 
         assert winner_candidate is not None
         handle = winner['handle']
@@ -1284,8 +1364,8 @@ class RetryingVmProvisioner(object):
                                                 task, cloud_user_identity)
         global_user_state.add_cluster_event(
             cluster_name, status_lib.ClusterStatus.INIT,
-            f'TPU Flex-start capacity acquired in {winner_candidate.region}; '
-            'other regional requests cleaned up.',
+            f'TPU Flex-start capacity acquired in {winner_candidate.zone}; '
+            'requests in other zones cleaned up.',
             global_user_state.ClusterEventType.STATUS_CHANGE)
         return winner
 
@@ -2153,7 +2233,7 @@ class RetryingVmProvisioner(object):
 
                 config_dict = None
                 if prev_cluster_status is None and not dryrun:
-                    config_dict = self._race_tpu_flex_start_regions(
+                    config_dict = self._race_tpu_flex_start_zones(
                         task, to_provision, num_nodes, stream_logs,
                         cluster_name, cloud_user)
                 if config_dict is None:
@@ -6231,12 +6311,16 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     else:
                         raise
 
-                # Clean up all cluster resources (e.g., Kubernetes services).
-                # This is a no-op for most clouds, but Kubernetes needs it to
-                # clean up orphaned services when pods are deleted externally.
+                # Clean up all cluster resources (e.g., Kubernetes services,
+                # GCP TPU MIGs still queued for capacity). This is a no-op for
+                # most clouds.
                 try:
                     provision_lib.cleanup_cluster_resources(
                         repr(cloud), cluster_name_on_cloud, config['provider'])
+                    if not failover:
+                        _cleanup_tpu_flex_start_race_members(
+                            repr(cloud), cluster_name_on_cloud,
+                            config['provider'])
                 except Exception as e:  # pylint: disable=broad-except
                     if purge:
                         msg = common_utils.format_exception(e, use_bracket=True)

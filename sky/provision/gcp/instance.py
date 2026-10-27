@@ -594,6 +594,31 @@ def stop_instances(
                            'STOPPED status.')
 
 
+def cleanup_cluster_resources(
+    cluster_name_on_cloud: str,
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """See sky/provision/__init__.py
+
+    A TPU MIG still queued for capacity has no instances, so a status refresh
+    treats its cluster as gone without calling terminate_instances. Delete the
+    MIG so Google Cloud cannot fulfill it later with nothing tracking it.
+    """
+    assert provider_config is not None, cluster_name_on_cloud
+    if not provider_config.get('_is_tpu_mig', False):
+        return
+    project_id = provider_config['project_id']
+    region = provider_config['availability_zone'].rpartition('-')[0]
+    resource = instance_utils.GCPManagedInstanceGroup
+    present = resource.tpu_mig_resources_present(project_id, region,
+                                                 cluster_name_on_cloud)
+    if not present:
+        return
+    logger.info(f'Deleting leftover TPU MIG resources {present} of '
+                f'{cluster_name_on_cloud!r} in {region}.')
+    resource.delete_tpu_mig_resources(project_id, region, cluster_name_on_cloud)
+
+
 def terminate_instances(
     cluster_name_on_cloud: str,
     provider_config: Optional[Dict[str, Any]] = None,
