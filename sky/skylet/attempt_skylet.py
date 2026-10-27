@@ -1,9 +1,11 @@
 """Restarts skylet if version does not match"""
 
-import argparse
 import os
+import shlex
 import signal
+import socket
 import subprocess
+import time
 from typing import List, Optional, Tuple
 
 import psutil
@@ -16,6 +18,81 @@ VERSION_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_VERSION_FILE)
 SKYLET_LOG_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_LOG_FILE)
 PID_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_PID_FILE)
 PORT_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_PORT_FILE)
+START_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_START_FILE)
+
+# Duplicated from sky/provision/slurm/utils.py to avoid importing that module.
+_SLURM_MARKER_FILE = '.sky_slurm_cluster'
+
+# Serialize both prefixes because SKYPILOT_ does not start with SKY_.
+_SKY_ENV_VAR_PREFIX = 'SKY_'
+
+
+def _serialize_launch_env() -> str:
+    """Serialize the launch environment for the host-side keeper.
+
+    HOME is excluded because it differs between the host and container.
+    PATH is prepended to the keeper's PATH rather than replacing it.
+    """
+    export_lines = []
+    path_value = os.environ.get('PATH')
+    if path_value is not None:
+        export_lines.append(f'export PATH={shlex.quote(path_value)}:"$PATH"')
+    for key in sorted(os.environ):
+        if key.startswith(
+            (constants.SKYPILOT_ENV_VAR_PREFIX, _SKY_ENV_VAR_PREFIX)):
+            export_lines.append(f'export {key}={shlex.quote(os.environ[key])}')
+    return '\n'.join(export_lines)
+
+
+def _is_inside_slurm_cluster() -> bool:
+    """Whether this allocation's sbatch script supports the skylet keeper.
+
+    Only the runtime marker proves that the sbatch script reads the start spec.
+    The generic Slurm check keeps the HOME fallback for older allocations.
+    """
+    return os.path.exists(
+        runtime_utils.get_runtime_dir_path(
+            os.path.join('.sky', _SLURM_MARKER_FILE)))
+
+
+def _start_skylet_via_keeper(port: int) -> None:
+    """Write the start spec and wait for the keeper to start skylet."""
+    launch_env = _serialize_launch_env()
+    start_spec = (
+        '#!/bin/bash\n'
+        '# Run by the Slurm skylet keeper.\n'
+        f'{launch_env}\n'
+        # exec preserves $$, so the PID file records skylet itself.
+        f'echo $$ > {PID_FILE}\n'
+        f'exec {constants.SKY_PYTHON_CMD} -m sky.skylet.skylet '
+        f'--port={port} >> {SKYLET_LOG_FILE} 2>&1\n')
+    # The spec may contain secrets.
+    # Create it as 0600 before writing. os.replace preserves the mode.
+    tmp_file = START_FILE + '.tmp'
+    fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as spec_file:
+        spec_file.write(start_spec)
+    os.replace(tmp_file, START_FILE)
+
+    # Require this cluster's PID file.
+    # A process scan can match another cluster's skylet.
+    # Enroot shares the PID namespace, so the host PID is valid in the
+    # container.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            with open(PID_FILE, 'r', encoding='utf-8') as pid_file:
+                pid = int(pid_file.read().strip())
+        except (OSError, ValueError):
+            pid = -1
+        if _is_running_skylet_process(pid):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        'Skylet keeper did not start skylet within 30 seconds: no live '
+        f'skylet process appeared in {PID_FILE}. Check that the keeper '
+        'step is running in the sbatch job (sbatch log) and see '
+        f'{SKYLET_LOG_FILE} for skylet errors.')
 
 
 def _is_running_skylet_process(pid: int) -> bool:
@@ -34,7 +111,7 @@ def _is_running_skylet_process(pid: int) -> bool:
         return False
 
 
-def _find_running_skylet_pids(use_legacy_fallback: bool = True) -> List[int]:
+def _find_running_skylet_pids() -> List[int]:
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, 'r', encoding='utf-8') as pid_file:
@@ -49,8 +126,6 @@ def _find_running_skylet_pids(use_legacy_fallback: bool = True) -> List[int]:
             print(f'Error reading PID file {PID_FILE}: {e}')
         return []
     else:
-        if not use_legacy_fallback:
-            return []
         # Fall back to grep-based detection for backward compatibility.
         pids = []
         # We use -m to grep instead of {constants.SKY_PYTHON_CMD} -m to grep
@@ -92,11 +167,40 @@ def _check_version_match() -> Tuple[bool, Optional[str]]:
     return False, version
 
 
-def _stop_skylet(use_legacy_fallback: bool = True) -> None:
+def _port_is_free(port: int) -> bool:
+    """Whether skylet's gRPC server could listen on ``port``.
+
+    Binds with SO_REUSEADDR, as that server does: connections the previous
+    skylet left in TIME_WAIT do not hold the port, a live listener does. A
+    plain bind would report busy after every restart that had a client.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(('', port))
+            s.listen(1)
+            return True
+        except OSError:
+            return False
+
+
+def restart_skylet():
     # Kills old skylet if it is running.
     # TODO(zhwu): make the killing graceful, e.g., use a signal to tell
     # skylet to exit, instead of directly killing it.
-    for pid in _find_running_skylet_pids(use_legacy_fallback):
+
+    on_slurm = _is_inside_slurm_cluster()
+    if on_slurm:
+        # Remove the old spec before killing skylet.
+        # This prevents the keeper from relaunching it.
+        # Any removal error except a missing file aborts before the kill.
+        try:
+            os.remove(START_FILE)
+        except FileNotFoundError:
+            pass
+
+    # Find and kill running skylet processes
+    for pid in _find_running_skylet_pids():
         try:
             os.kill(pid, signal.SIGKILL)
             # Wait until process fully terminates so its socket gets released.
@@ -113,42 +217,33 @@ def _stop_skylet(use_legacy_fallback: bool = True) -> None:
     except OSError:
         pass  # Best effort cleanup
 
-
-def restart_skylet(foreground: bool = False) -> None:
-    _stop_skylet(use_legacy_fallback=not foreground)
-
-    # TODO(kevin): Handle race conditions here. Race conditions can only
-    # happen on Slurm, where there could be multiple clusters running in
-    # one network namespace. For other clouds, the behaviour will be that
-    # it always gets port 46590 (default port).
-    port = common_utils.find_free_port(constants.SKYLET_GRPC_PORT)
-    # We have made sure that `attempt_skylet.py` is executed with the
-    # skypilot runtime env activated, so that skylet can access the cloud
-    # CLI tools.
-    skylet_cmd = (f'{constants.SKY_PYTHON_CMD} -m sky.skylet.skylet '
-                  f'--port={port}')
-    if foreground:
-        with open(SKYLET_LOG_FILE, 'a', encoding='utf-8') as log_file:
-            process = subprocess.Popen(f'exec {skylet_cmd}',
-                                       shell=True,
-                                       stdout=log_file,
-                                       stderr=subprocess.STDOUT)
-            with open(PID_FILE, 'w', encoding='utf-8') as pid_file:
-                pid_file.write(str(process.pid))
-            _write_metadata(port)
-            process.wait()
-        return
-
-    subprocess.run(
-        f'nohup {skylet_cmd} '
-        f'>> {SKYLET_LOG_FILE} 2>&1 & echo $! > {PID_FILE}',
-        shell=True,
-        check=True)
-    _write_metadata(port)
-
-
-def _write_metadata(port: int) -> None:
-    """Write metadata used by Skylet clients and version checks."""
+    # TODO(kevin): Handle race conditions here. They happen where several
+    # clusters share one network namespace: on Slurm, and on Kubernetes under
+    # hostNetwork for a pod created before the server assigned skylet a port.
+    assigned = os.environ.get(constants.SKYLET_PORT_ENV_VAR)
+    if assigned:
+        # The server assigned this port (a Kubernetes hostNetwork pod) and
+        # dials exactly it, so drifting to the next free one would hand this
+        # cluster's requests to whatever holds it. Fail instead.
+        port = int(assigned)
+        if not _port_is_free(port):
+            raise RuntimeError(
+                f'skylet port {port}, assigned to this pod, is already in use '
+                'on its node.')
+    else:
+        port = common_utils.find_free_port(constants.SKYLET_GRPC_PORT)
+    if on_slurm:
+        _start_skylet_via_keeper(port)
+    else:
+        subprocess.run(
+            # We have made sure that `attempt_skylet.py` is executed with the
+            # skypilot runtime env activated, so that skylet can access the
+            # cloud CLI tools.
+            f'nohup {constants.SKY_PYTHON_CMD} -m sky.skylet.skylet '
+            f'--port={port} '
+            f'>> {SKYLET_LOG_FILE} 2>&1 & echo $! > {PID_FILE}',
+            shell=True,
+            check=True)
 
     with open(PORT_FILE, 'w', encoding='utf-8') as pf:
         pf.write(str(port))
@@ -157,41 +252,22 @@ def _write_metadata(port: int) -> None:
         v_f.write(constants.SKYLET_VERSION)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--foreground', action='store_true')
-    parser.add_argument('--stop-if-stale', action='store_true')
-    args = parser.parse_args()
+# Check if our skylet is running
+running = bool(_find_running_skylet_pids())
 
-    managed = args.foreground or args.stop_if_stale
-    running_pids = _find_running_skylet_pids(use_legacy_fallback=not managed)
-    running = bool(running_pids)
-    version_match, found_version = _check_version_match()
+version_match, found_version = _check_version_match()
 
-    if args.stop_if_stale:
-        if not running or not version_match:
-            _stop_skylet(use_legacy_fallback=False)
-        return
+version_string = (f' (found version {found_version}, new version '
+                  f'{constants.SKYLET_VERSION})')
+if not running:
+    print('Skylet is not running. Starting (version '
+          f'{constants.SKYLET_VERSION})...')
+elif not version_match:
+    print(f'Skylet is stale{version_string}. Restarting...')
+else:
+    print(
+        f'Skylet is running with the latest version {constants.SKYLET_VERSION}.'
+    )
 
-    version_string = (f' (found version {found_version}, new version '
-                      f'{constants.SKYLET_VERSION})')
-    if not running:
-        print('Skylet is not running. Starting (version '
-              f'{constants.SKYLET_VERSION})...')
-    elif not version_match:
-        print(f'Skylet is stale{version_string}. Restarting...')
-    else:
-        print('Skylet is running with the latest version '
-              f'{constants.SKYLET_VERSION}.')
-
-    if not running or not version_match:
-        restart_skylet(foreground=args.foreground)
-    elif args.foreground:
-        try:
-            psutil.Process(running_pids[0]).wait()
-        except psutil.NoSuchProcess:
-            pass
-
-
-if __name__ == '__main__':
-    main()
+if not running or not version_match:
+    restart_skylet()

@@ -29,7 +29,7 @@ from sky.skylet import job_lib
 from sky.utils import log_utils
 from sky.utils import subprocess_utils
 
-if int(constants.SKYLET_VERSION) >= 43:
+if int(constants.SKYLET_VERSION) >= 44:
     job_lib.mark_job_driver_started(3)
 SKY_REMOTE_WORKDIR = '~/sky_workdir'
 

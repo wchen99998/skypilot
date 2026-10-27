@@ -90,7 +90,7 @@ def create_table(cursor, conn):
     #    INIT state, the pid will be set to 0.
     # >=0: The job has been started. The pid is the driver process's pid.
     #      The driver can be actually running or finished.
-    # TODO(SKY-1213): username is actually user hash, should rename.
+    # TODO: username is actually user hash, should rename.
     cursor.execute("""\
         CREATE TABLE IF NOT EXISTS jobs (
         job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -467,6 +467,7 @@ class JobScheduler:
                     continue
                 if submit:
                     if submit < 0:
+                        assert _DB is not None
                         pid = _DB.cursor.execute(
                             'SELECT pid FROM jobs WHERE job_id=(?)',
                             (job_id,)).fetchone()[0]
@@ -1047,7 +1048,7 @@ def _get_process_create_time(pid: Optional[int]) -> Optional[float]:
 def _is_legacy_job_driver_process_running(
         pid: Optional[int], job_id: int,
         expected_create_time: Optional[float]) -> bool:
-    """Check a captured legacy PID using its script path and process identity."""
+    """Check a captured legacy PID by script path and process identity."""
     create_time = _get_process_create_time(pid)
     if (create_time is None or (expected_create_time is not None and
                                 create_time != expected_create_time)):
@@ -1456,7 +1457,7 @@ class JobLibCodeGen:
         ]
         if submission_id is not None:
             code.extend([
-                '\nif int(constants.SKYLET_VERSION) < 43: '
+                '\nif int(constants.SKYLET_VERSION) < 44: '
                 'raise RuntimeError("SkyPilot runtime is too old for '
                 'retry-safe job submission. Run sky launch to upgrade it.")',
                 '\nresult = job_lib.add_job('
@@ -1574,7 +1575,7 @@ class JobLibCodeGen:
             code = [f'job_lib.scheduler.queue({job_id!r},{cmd!r})']
         else:
             code = [
-                '\nif int(constants.SKYLET_VERSION) < 43: '
+                '\nif int(constants.SKYLET_VERSION) < 44: '
                 'raise RuntimeError("SkyPilot runtime is too old for '
                 'allocation-owned job launch. Run sky launch to upgrade it.")',
                 f'\njob_lib.scheduler.queue({job_id!r},{cmd!r},schedule=False)',
@@ -1597,7 +1598,7 @@ class JobLibCodeGen:
 
     @classmethod
     def get_job_queue(cls, user_hash: Optional[str], all_jobs: bool) -> str:
-        # TODO(SKY-1214): combine get_job_queue with get_job_statuses.
+        # TODO: combine get_job_queue with get_job_statuses.
         code = [
             'job_queue = job_lib.dump_job_queue('
             f'{user_hash!r}, {all_jobs})',
@@ -1622,7 +1623,7 @@ class JobLibCodeGen:
             ]
         else:
             code = [
-                '\nif int(constants.SKYLET_VERSION) < 43: '
+                '\nif int(constants.SKYLET_VERSION) < 44: '
                 'raise RuntimeError("SkyPilot runtime is too old for '
                 'allocation-owned job launch. Run sky launch to upgrade it.")',
                 (f'\ncancelled = job_lib.cancel_jobs_encoded_results('
@@ -1668,7 +1669,12 @@ class JobLibCodeGen:
                 f'\nelse:'
                 f'\n  log_lib.tail_logs(job_id=job_id, log_dir=log_dir, managed_job_id={managed_job_id!r}, follow={follow}, tail={tail}, tail_offset={tail_offset})'
             )
-        code = [
+        code = []
+        if follow:
+            # getattr: clusters whose runtime predates the watchdog lack it.
+            code.append(
+                'getattr(log_lib, "start_orphan_watchdog", lambda: None)()')
+        code += [
             # We use != instead of is not because 1 is not None will print a warning:
             # <stdin>:1: SyntaxWarning: "is not" with a literal. Did you mean "!="?
             f'job_id = {job_id} if {job_id} != None else job_lib.get_latest_job_id()',

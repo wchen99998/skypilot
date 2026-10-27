@@ -252,7 +252,7 @@ def test_add_job_codegen_carries_submission_id():
     python_code = shlex.split(code)[-1]
     compile(python_code, '<add-job>', 'exec')
     assert "submission_id='api-request-id'" in python_code
-    assert 'SKYLET_VERSION) < 43' in python_code
+    assert 'SKYLET_VERSION) < 44' in python_code
 
 
 def test_add_job_codegen_preserves_legacy_signature():
@@ -289,7 +289,7 @@ def test_queue_codegen_preserves_legacy_call_and_gates_slurm():
         job_lib.JobLibCodeGen.queue_job(1, 'train-command', schedule=False))[-1]
 
     assert 'schedule=' not in legacy_code
-    assert 'SKYLET_VERSION) < 43' in slurm_code
+    assert 'SKYLET_VERSION) < 44' in slurm_code
     assert 'schedule=False' in slurm_code
 
 

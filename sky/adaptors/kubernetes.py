@@ -25,6 +25,8 @@ from sky.utils import common_utils
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
+    import decimal
+
     import kubernetes
     import urllib3
     import urllib3.exceptions
@@ -57,6 +59,12 @@ IN_CLUSTER_CONTEXT_NAME_ENV_VAR = 'SKYPILOT_IN_CLUSTER_CONTEXT_NAME'
 # interval.
 KUBECONFIG_REFRESH_INTERVAL_ENV_VAR = (
     'SKYPILOT_KUBECONFIG_REFRESH_INTERVAL_SECONDS')
+# Connections an ApiClient keeps for reuse. The API server normally closes
+# idle connections, but if something in between does not pass that close on,
+# every connection opened at peak concurrency stays open for as long as the
+# client lives, which can be the whole process (e.g. a jobs controller).
+# Requests beyond this many in parallel use a connection that closes afterwards.
+CONNECTION_POOL_MAXSIZE = 4
 
 logger = sky_logging.init_logger(__name__)
 
@@ -143,6 +151,11 @@ def _get_api_client(context: Optional[str] = None) -> Any:
     """
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+    def _new_configuration() -> Any:
+        config = kubernetes.client.Configuration()
+        config.connection_pool_maxsize = CONNECTION_POOL_MAXSIZE
+        return config
+
     def _get_api_client_from_kubeconfig(context: Optional[str] = None) -> Any:
         """Load kubeconfig, return ApiClient without modifying global state."""
         try:
@@ -150,7 +163,9 @@ def _get_api_client(context: Optional[str] = None) -> Any:
             # specified context WITHOUT modifying the global configuration.
             # This is the key to thread-safety.
             return kubernetes.config.new_client_from_config(
-                config_file=_get_config_file(), context=context)
+                config_file=_get_config_file(),
+                context=context,
+                client_configuration=_new_configuration())
         except kubernetes.config.config_exception.ConfigException as e:
             suffix = common_utils.format_exception(e, use_bracket=True)
             context_name = '(current-context)' if context is None else context
@@ -212,7 +227,7 @@ def _get_api_client(context: Optional[str] = None) -> Any:
             if 'KUBERNETES_SERVICE_PORT' not in os.environ:
                 os.environ['KUBERNETES_SERVICE_PORT'] = '443'
 
-            config = kubernetes.client.Configuration()
+            config = _new_configuration()
             kubernetes.config.load_incluster_config(config)
             return _enable_response_compression(
                 kubernetes.client.ApiClient(configuration=config))
@@ -427,6 +442,18 @@ def watch(context: Optional[str] = None):
     w = kubernetes.watch.Watch()
     w._api_client = _get_api_client(context)  # pylint: disable=protected-access
     return w
+
+
+def parse_quantity(quantity: str) -> 'decimal.Decimal':
+    """Parses a Kubernetes resource quantity into a number of bytes.
+
+    Kubernetes' own grammar, which is not SkyPilot's: a bare number is bytes,
+    and both binary (`10Gi`) and decimal (`2G`) suffixes are legal, as is
+    exponent notation. Anything read off an object the cluster owns has to be
+    read with these rules -- a claim SkyPilot did not create is written
+    however its author wrote it.
+    """
+    return kubernetes.utils.parse_quantity(quantity)
 
 
 def api_exception():

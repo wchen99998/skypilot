@@ -14,80 +14,95 @@
 # Cleanup function to remove cluster dirs on job termination.
 cleanup() {
     saved_exit=$?
-    echo "Terminating Skylet service..."
-    if [ -n "${SKYLET_SERVICE_PID:-}" ]; then
-        kill "$SKYLET_SERVICE_PID" 2>/dev/null || true
+    # Preserve the result while teardown signals arrive during cleanup.
+    trap '' TERM
+    if [ -f /tmp/test-cluster-no-container.exitcode."${SLURM_JOB_ID}" ]; then
+        saved_exit=$(cat /tmp/test-cluster-no-container.exitcode."${SLURM_JOB_ID}") || saved_exit=1
     fi
+    # Prevent the keeper from restarting Skylet during cleanup.
+    rm -f "/tmp/test-cluster-no-container/.sky/skylet_start"
+    echo "Terminating Skylet..."
     if [ -s "/tmp/test-cluster-no-container/.sky/skylet_pid" ]; then
         skylet_pid=$(cat "/tmp/test-cluster-no-container/.sky/skylet_pid")
         if [ "$skylet_pid" -gt 0 ] 2>/dev/null &&                 ps -p "$skylet_pid" -o args= | grep -q "sky.skylet.skylet"; then
             kill "$skylet_pid" 2>/dev/null || true
         fi
     fi
-    if [ -n "${SKYLET_SERVICE_PID:-}" ]; then
-        wait "$SKYLET_SERVICE_PID" 2>/dev/null || true
-    fi
-    if [ -n "${CONTAINER_PID:-}" ]; then
-        kill "$CONTAINER_PID" 2>/dev/null || true
-        wait "$CONTAINER_PID" 2>/dev/null || true
-    fi
     echo "Cleaning up sky directories..."
     # Remove the per-node enroot container, if it exists.
     # This is only needed when container_scope=global.
     # When container_scope=job, named containers are removed automatically
     # at the end of the Slurm job, see: https://github.com/NVIDIA/pyxis/wiki/Setup#slurm-epilog
-    srun --nodes=1 --ntasks-per-node=1 enroot remove -f pyxis_test-cluster-no-container 2>/dev/null || true
+    srun --overlap --nodes=1 --ntasks-per-node=1 enroot remove -f pyxis_test-cluster-no-container 2>/dev/null || true
     # Clean up sky runtime directory on each node.
     # NOTE: We can do this because --nodes for both this srun and the
     # sbatch is the same number. Otherwise, there are no guarantees
     # that this srun will run on the same subset of nodes as the srun
     # that created the sky directories.
-    srun --nodes=1 --ntasks-per-node=1 rm -rf -- /tmp/test-cluster-no-container
-    rm -rf /home/testuser/.sky_clusters/test-cluster-no-container
+    srun --overlap --nodes=1 --ntasks-per-node=1 rm -rf -- /tmp/test-cluster-no-container /tmp/test-cluster-no-container.exitcode."${SLURM_JOB_ID}"
+    # A stop publishes the snapshot manifest before cancellation. Keep the
+    # logs referenced by the jobs database that start will restore.
+    if [ -f /home/testuser/.sky_snapshots/test-cluster-no-container/manifest.json ]; then
+        find /home/testuser/.sky_clusters/test-cluster-no-container -mindepth 1 -maxdepth 1 \
+            ! -name sky_logs \
+            -exec rm -rf -- {} +
+    else
+        rm -rf -- /home/testuser/.sky_clusters/test-cluster-no-container
+    fi
     exit $saved_exit
 }
 # Run cleanup on any exit, including container init failures.
 trap cleanup EXIT
-# On SIGTERM (job cancellation via scancel), exit 0 so cleanup treats
-# it as a graceful shutdown rather than propagating an error code.
-trap 'exit 0' TERM
+# Preserve the last submitted task's result for Slurm dependencies.
+terminate() {
+    if [ -f /tmp/test-cluster-no-container.exitcode."${SLURM_JOB_ID}" ]; then
+        task_exit=$(cat /tmp/test-cluster-no-container.exitcode."${SLURM_JOB_ID}") || exit 1
+    else
+        task_exit=$(export SKY_RUNTIME_DIR=/tmp/test-cluster-no-container
+if [ ! -f /tmp/test-cluster-no-container/.sky/jobs.db ]; then
+    echo 0
+else
+$([ -x /usr/bin/env ] && echo /usr/bin/env || type -P env 2>/dev/null || echo /usr/bin/env) -u PYTHONPATH $([ -s ${SKY_RUNTIME_DIR:-$HOME}/.sky/python_path ] && cat ${SKY_RUNTIME_DIR:-$HOME}/.sky/python_path 2> /dev/null || command -v python3) - /tmp/test-cluster-no-container/.sky/jobs.db <<'SKY_JOB_EXIT_CODE'
+import pathlib
+import sqlite3
+import sys
+
+path = pathlib.Path(sys.argv[1])
+code = 0
+if path.exists():
+    with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as conn:
+        row = conn.execute(
+            'SELECT status, exit_codes FROM jobs ORDER BY job_id DESC LIMIT 1'
+        ).fetchone()
+    if row is not None and row[0] != 'SUCCEEDED':
+        codes = [int(value) for value in (row[1] or '').split(',') if value]
+        code = next((value for value in codes if value != 0), 1)
+        if code < 0:
+            code = 128 - code
+print(code)
+SKY_JOB_EXIT_CODE
+fi
+) || exit 1
+    fi
+    exit "$task_exit"
+}
+trap terminate TERM
 
 # Create sky home directory and subdirectories for the cluster.
 mkdir -p /home/testuser/.sky_clusters/test-cluster-no-container/sky_logs /home/testuser/.sky_clusters/test-cluster-no-container/sky_workdir /home/testuser/.sky_clusters/test-cluster-no-container/.sky
 # A new allocation must not inherit jobs, PIDs, or version files from a prior
 # allocation whose EXIT trap could not run (for example after SIGKILL).
 srun --nodes=1 --ntasks-per-node=1 rm -rf -- /tmp/test-cluster-no-container
-srun --nodes=1 --ntasks-per-node=1 mkdir -p -- /tmp/test-cluster-no-container
+# Create sky runtime directory on each node.
+srun --nodes=1 --ntasks-per-node=1 mkdir -p -- /tmp/test-cluster-no-container/.sky
 # Marker file to indicate we're in a Slurm cluster.
-touch /home/testuser/.sky_clusters/test-cluster-no-container/.sky_slurm_cluster
+srun --nodes=1 touch /tmp/test-cluster-no-container/.sky/.sky_slurm_cluster
 # Store proctrack type for task executor to read.
 echo 'cgroup' > /home/testuser/.sky_clusters/test-cluster-no-container/.sky_proctrack_type
 # Suppress login messages.
 touch /home/testuser/.sky_clusters/test-cluster-no-container/.hushlogin
-rm -f /home/testuser/.sky_clusters/test-cluster-no-container/.sky/skylet_start.sh /tmp/test-cluster-no-container/.sky/skylet_service
-SKYLET_START=$SECONDS
-echo "[skylet] Starting service on $SLURMD_NODENAME"
-bash -c 'export SKY_RUNTIME_DIR=/tmp/test-cluster-no-container
-cd /home/testuser/.sky_clusters/test-cluster-no-container
-export HOME="$PWD"
-mkdir -p /tmp/test-cluster-no-container/.sky
-touch /tmp/test-cluster-no-container/.sky/skylet_service
-while [ ! -s /home/testuser/.sky_clusters/test-cluster-no-container/.sky/skylet_start.sh ]; do sleep 1; done
-while true; do
-    bash /home/testuser/.sky_clusters/test-cluster-no-container/.sky/skylet_start.sh
-    sleep 1
-done
-' &
-SKYLET_SERVICE_PID=$!
-while [ ! -f /tmp/test-cluster-no-container/.sky/skylet_service ]; do
-  if ! kill -0 "$SKYLET_SERVICE_PID" 2>/dev/null; then
-    echo "[skylet] ERROR: Service failed to start."
-    wait "$SKYLET_SERVICE_PID"
-    exit $?
-  fi
-  sleep 1
-done
-echo "[skylet] Service ready in $((SECONDS - SKYLET_START))s"
 
 touch /home/testuser/.sky_clusters/test-cluster-no-container/.sky_sbatch_ready_$SLURM_JOB_ID
-wait "$SKYLET_SERVICE_PID"
+# Host-side keeper step that starts skylet and restarts it if it dies.
+( while true; do SKY_HEAD_NODE=$(scontrol show hostnames "$(squeue -h --jobs "$SLURM_JOB_ID" -o %N)" | head -n1); [ -n "$SKY_HEAD_NODE" ] && srun --overlap --jobid=$SLURM_JOB_ID --nodes=1 --ntasks=1 --job-name=sky-skylet-keeper --nodelist=$SKY_HEAD_NODE bash -c 'while true; do if [ -f /tmp/test-cluster-no-container/.sky/skylet_start ]; then touch /home/testuser/.sky_clusters/test-cluster-no-container/.sky/skylet_started_"$SLURM_JOB_ID"; SKYPILOT_SLURM_SKYLET_OWNER=1 HOME=/home/testuser/.sky_clusters/test-cluster-no-container bash /tmp/test-cluster-no-container/.sky/skylet_start; fi; sleep 5; done'; sleep 5; done ) &
+sleep infinity

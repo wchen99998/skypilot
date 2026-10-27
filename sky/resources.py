@@ -156,7 +156,7 @@ class Resources:
     """
     # If any fields changed, increment the version. For backward compatibility,
     # modify the __setstate__ method to handle the old version.
-    _VERSION = 35  # remove ephemeral_storage; use disk_size for k8s.
+    _VERSION = 36  # add _kubernetes_identity, _remote_identity_none.
 
     def __init__(
         self,
@@ -465,6 +465,12 @@ class Resources:
         self._requires_fuse = _requires_fuse
 
         self._cluster_config_overrides = _cluster_config_overrides
+        # Not a constructor argument and never in YAML, so a requester cannot
+        # set it: only a cluster SkyPilot launches in-process for itself does.
+        self._kubernetes_identity: Optional[str] = None
+        # Recorded from the rendered cluster config when a Kubernetes cluster
+        # is launched; None until then (and for clusters from older versions).
+        self._remote_identity_none: Optional[bool] = None
         self._cached_repr: Optional[str] = None
         self._no_missing_accel_warnings = _no_missing_accel_warnings
 
@@ -825,6 +831,24 @@ class Resources:
         # TODO(zeping): This violates the immutability of Resources.
         #  Refactor to use Resources.copy instead.
         self._requires_fuse = value
+
+    @property
+    def kubernetes_identity(self) -> Optional[str]:
+        """A fixed Kubernetes service account, exempt from remote_identity."""
+        return self._kubernetes_identity
+
+    def set_kubernetes_identity(self, service_account: Optional[str]) -> None:
+        # Mutates in place like set_requires_fuse: the task's resources are
+        # shared with the dag the launch already holds.
+        self._kubernetes_identity = service_account
+
+    @property
+    def remote_identity_none_at_launch(self) -> Optional[bool]:
+        """Whether its launched pods got no Kubernetes token, if known."""
+        return self._remote_identity_none
+
+    def set_remote_identity_none_at_launch(self, value: Optional[bool]) -> None:
+        self._remote_identity_none = value
 
     @property
     def cluster_config_overrides(self) -> Dict[str, Any]:
@@ -2259,15 +2283,33 @@ class Resources:
         if current_override_configs is None:
             current_override_configs = {}
         new_override_configs = override.pop('_cluster_config_overrides', {})
-        overlaid_configs = skypilot_config.overlay_skypilot_config(
-            original_config=config_utils.Config(current_override_configs),
-            override_configs=new_override_configs,
-        )
-        override_configs = config_utils.Config()
+        # Only the incoming overrides are filtered to the overrideable
+        # keys. The existing overrides are kept as-is: they were already
+        # accepted when this Resources was constructed, and on the client
+        # the full set of overrideable keys is not known (the server may
+        # register additional keys via
+        # skypilot_config.register_task_overrideable_config_key), so
+        # re-filtering here would silently drop them before the server
+        # can act on them.
+        filtered_new_configs = config_utils.Config()
+        new_configs = config_utils.Config(new_override_configs or {})
+        missing = object()
         for key in constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK:
-            elem = overlaid_configs.get_nested(key, None)
-            if elem is not None:
-                override_configs.set_nested(key, elem)
+            elem = new_configs.get_nested(key, missing)
+            if elem is not missing:
+                # Explicit null values are kept so they can clear an
+                # existing override below.
+                filtered_new_configs.set_nested(key, elem)
+        override_configs = skypilot_config.overlay_skypilot_config(
+            original_config=config_utils.Config(current_override_configs),
+            override_configs=filtered_new_configs,
+        )
+        # A null-valued overrideable key (e.g. `--config gcp.vpc_name=null`)
+        # clears the task-level override so the CLI/global config value takes
+        # effect, instead of the existing task value surviving the overlay.
+        for key in constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK:
+            if override_configs.get_nested(key, missing) is None:
+                override_configs.pop_nested(key, None)
 
         current_autostop_config = None
         if self.autostop_config is not None:
@@ -2328,6 +2370,8 @@ class Resources:
             _no_missing_accel_warnings=override.pop(
                 'no_missing_accel_warnings', self._no_missing_accel_warnings),
         )
+        resources.set_kubernetes_identity(self._kubernetes_identity)
+        resources.set_remote_identity_none_at_launch(self._remote_identity_none)
         assert not override
         return resources
 
@@ -2661,8 +2705,28 @@ class Resources:
         resources_fields['_is_image_managed'] = config.pop(
             '_is_image_managed', None)
         resources_fields['_requires_fuse'] = config.pop('_requires_fuse', None)
-        resources_fields['_cluster_config_overrides'] = config.pop(
-            '_cluster_config_overrides', None)
+        cluster_config_overrides = config.pop('_cluster_config_overrides', None)
+        if cluster_config_overrides:
+            # A task's `config` field crosses the client/server boundary as
+            # `resources._cluster_config_overrides`, whose entry in the
+            # resources schema is just `{'type': 'object'}` — so unlike
+            # `job_recovery`, the resources-schema validation above does not
+            # cover its contents. Re-validate against the task-level config
+            # schema here: on the server (plugins loaded) this is the strict,
+            # plugin-aware schema, so keys and value shapes a lenient client
+            # passed through are enforced at deserialization.
+            # skip_none=False: the default strips top-level None-valued
+            # keys before validating, which would let an unknown section
+            # through as long as its value is null (it survives into the
+            # overrides regardless). Nested nulls are untouched either
+            # way, so `--config gcp.vpc_name=null` still validates.
+            common_utils.validate_schema(
+                cluster_config_overrides,
+                schemas.get_task_schema()['properties']['config'],
+                'Invalid resources.config override: ',
+                skip_none=False)
+        resources_fields['_cluster_config_overrides'] = (
+            cluster_config_overrides)
 
         if resources_fields['cpus'] is not None:
             resources_fields['cpus'] = str(resources_fields['cpus'])
@@ -2969,6 +3033,10 @@ class Resources:
 
         if version < 34:
             self._docker_image = None
+
+        if version < 36:
+            self._kubernetes_identity = None
+            self._remote_identity_none = None
 
         if version < 35:
             state.pop('_ephemeral_storage', None)

@@ -69,7 +69,7 @@ class TaskCodeGen:
             from sky.utils import subprocess_utils
             """))
         self._code.append(
-            f'if int(constants.SKYLET_VERSION) >= 43:\n'
+            f'if int(constants.SKYLET_VERSION) >= 44:\n'
             f'    job_lib.mark_job_driver_started({self.job_id!r})')
 
     def _add_logging_functions(self) -> None:
@@ -938,18 +938,11 @@ class SlurmCodeGen(TaskCodeGen):
                     #   resolve_ctls_from_dns_srv: res_nsearch error: Unknown host
                     #   fetch_config: DNS SRV lookup failed
                     #   fatal: Could not establish a configuration source
-                    cmd_parts = []
-                    # Only unset SKY_RUNTIME_DIR for container runs. For non-container
-                    # runs, we want to inherit the node-local SKY_RUNTIME_DIR set by
-                    # SlurmCommandRunner to avoid SQLite WAL issues on shared filesystems.
-                    if {True if container_flags else False}:
-                        cmd_parts.append('unset SKY_RUNTIME_DIR;')
-                    cmd_parts.extend([
+                    bash_cmd = shlex.quote(' '.join([
                         constants.SKY_SLURM_PYTHON_CMD,
                         '-m sky.skylet.executor.slurm',
                         runner_args,
-                    ])
-                    bash_cmd = shlex.quote(' '.join(cmd_parts))
+                    ]))
                     srun_cmd = (
                         "unset $(env | awk -F= '/^SLURM_/ && $1 !~ /^SLURM_CONF/ {{print $1}}') && "
                         f'srun --export=ALL --quiet --unbuffered --kill-on-bad-exit --jobid={self._slurm_job_id} '
