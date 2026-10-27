@@ -947,6 +947,16 @@ def _setup_proxy_command_on_controller(
         ssh_proxy_command = {k: None for k in ssh_proxy_command}
         config.set_nested(proxy_command_key, ssh_proxy_command)
 
+    # A user-managed GCP VPC (`gcp.vpc_name`) means SkyPilot does not manage
+    # its firewall, which may only admit SSH from inside the VPC. The
+    # controller runs in that VPC, so it reaches job clusters over internal
+    # IPs; external IPs stay enabled for the clusters' outbound traffic.
+    if (str(controller_launched_cloud).lower() == 'gcp' and config.get_nested(
+        ('gcp', 'vpc_name'), None) is not None and config.get_nested(
+            ('gcp', 'use_internal_ips'), None) is None):
+        config.set_nested(('gcp', 'use_internal_ips'), True)
+        config.set_nested(('gcp', 'force_enable_external_ips'), True)
+
     return config
 
 

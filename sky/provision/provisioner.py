@@ -7,6 +7,7 @@ import os
 import shlex
 import socket
 import subprocess
+import threading
 import time
 import traceback
 from typing import Dict, List, Optional, Tuple
@@ -57,11 +58,18 @@ def _bulk_provision(
     region: clouds.Region,
     cluster_name: resources_utils.ClusterName,
     bootstrap_config: provision_common.ProvisionConfig,
+    cancel_event: Optional[threading.Event] = None,
+    record_cluster_event: bool = True,
 ) -> provision_common.ProvisionRecord:
     provider_name = repr(cloud)
     region_name = region.name
 
     start = time.time()
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise provision_common.ProvisionCancelledError(
+            f'Provisioning in {region_name} was cancelled because another '
+            'region acquired capacity.')
 
     provision_volume.provision_ephemeral_volumes(cloud, region_name,
                                                  cluster_name.name_on_cloud,
@@ -75,6 +83,12 @@ def _bulk_provision(
     config = provision.bootstrap_instances(provider_name, region_name,
                                            cluster_name.name_on_cloud,
                                            bootstrap_config)
+    if cancel_event is not None and cancel_event.is_set():
+        raise provision_common.ProvisionCancelledError(
+            f'Provisioning in {region_name} was cancelled because another '
+            'region acquired capacity.')
+    if cancel_event is not None:
+        config.provider_config['_provision_cancel_event'] = cancel_event
 
     provision_record = provision.run_instances(provider_name,
                                                region_name,
@@ -89,10 +103,11 @@ def _bulk_provision(
         backoff = common_utils.Backoff(initial_backoff=1, max_backoff_factor=3)
         logger.debug(
             f'\nWaiting for instances of {cluster_name!r} to be ready...')
-        rich_utils.force_update_status(
-            ux_utils.spinner_message('Launching - Checking instance status',
-                                     str(provision_logging.config.log_path),
-                                     cluster_name=str(cluster_name)))
+        if record_cluster_event:
+            rich_utils.force_update_status(
+                ux_utils.spinner_message('Launching - Checking instance status',
+                                         str(provision_logging.config.log_path),
+                                         cluster_name=str(cluster_name)))
         # AWS would take a very short time (<<1s) updating the state of the
         # instance.
         time.sleep(1)
@@ -118,10 +133,11 @@ def _bulk_provision(
         f'seconds.')
 
     # Add cluster event for provisioning completion.
-    global_user_state.add_cluster_event(
-        str(cluster_name), status_lib.ClusterStatus.INIT,
-        f'Instances launched on {cloud.display_name()} in {region}',
-        global_user_state.ClusterEventType.STATUS_CHANGE)
+    if record_cluster_event:
+        global_user_state.add_cluster_event(
+            str(cluster_name), status_lib.ClusterStatus.INIT,
+            f'Instances launched on {cloud.display_name()} in {region}',
+            global_user_state.ClusterEventType.STATUS_CHANGE)
 
     return provision_record
 
@@ -137,6 +153,8 @@ def bulk_provision(
     prev_cluster_ever_up: bool,
     log_dir: str,
     ports_to_open_on_launch: Optional[List[int]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    record_cluster_event: bool = True,
 ) -> provision_common.ProvisionRecord:
     """Provisions a cluster and wait until fully provisioned.
 
@@ -169,8 +187,12 @@ def bulk_provision(
             redacted_config = bootstrap_config.get_redacted_config()
             logger.debug('Provision config:\n'
                          f'{json.dumps(redacted_config, indent=2)}')
-            return _bulk_provision(cloud, region, cluster_name,
-                                   bootstrap_config)
+            return _bulk_provision(cloud,
+                                   region,
+                                   cluster_name,
+                                   bootstrap_config,
+                                   cancel_event=cancel_event,
+                                   record_cluster_event=record_cluster_event)
         except exceptions.NoClusterLaunchedError:
             # Skip the teardown if the cluster was never launched.
             raise

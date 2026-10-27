@@ -1,4 +1,6 @@
 """Backend: runs on cloud virtual machines, managed by Ray."""
+import concurrent.futures
+import contextvars
 import copy
 import dataclasses
 import enum
@@ -1037,6 +1039,256 @@ class RetryingVmProvisioner(object):
             message = message.rstrip() + f'\nReason: {last_error_reason}'
         return message
 
+    def _record_cluster_provisioning_state(
+        self,
+        cluster_name: str,
+        handle: 'CloudVmRayResourceHandle',
+        requested_resources: Set[resources_lib.Resources],
+        provision_log_path: str,
+        task: task_lib.Task,
+        cloud_user_identity: Optional[List[str]],
+    ) -> None:
+        cloud = handle.launched_resources.cloud
+        assert cloud is not None
+        usage_lib.messages.usage.update_final_cluster_status(
+            status_lib.ClusterStatus.INIT)
+        global_user_state.add_or_update_cluster(
+            cluster_name,
+            cluster_handle=handle,
+            requested_resources=requested_resources,
+            ready=False,
+            is_managed=self._is_managed,
+            provision_log_path=provision_log_path,
+            task_config=task.to_yaml_config(use_user_specified_yaml=True),
+        )
+        global_user_state.add_cluster_event(
+            cluster_name, status_lib.ClusterStatus.INIT,
+            f'Provisioning on {cloud.display_name()} '
+            f'in {handle.launched_resources.region}',
+            global_user_state.ClusterEventType.STATUS_CHANGE)
+        global_user_state.set_owner_identity_for_cluster(
+            cluster_name, cloud_user_identity)
+
+    def _get_tpu_flex_start_region_candidates(
+        self,
+        task: task_lib.Task,
+        to_provision: resources_lib.Resources,
+    ) -> List[resources_lib.Resources]:
+        if (not isinstance(to_provision.cloud, clouds.GCP) or
+                to_provision.use_spot or to_provision.instance_type is None or
+                not to_provision.instance_type.startswith(
+                    ('ct6e-standard-', 'tpu7x-standard-'))):
+            return []
+
+        request_allows_multiple_regions = any(
+            requested.region is None and requested.zone is None and
+            (requested.cloud is None or isinstance(requested.cloud, clouds.GCP)
+            ) and requested.instance_type == to_provision.instance_type
+            for requested in task.resources)
+        if not request_allows_multiple_regions:
+            return []
+
+        unrestricted = to_provision.copy(region=None, zone=None)
+        candidates = []
+        for region in unrestricted.get_valid_regions_for_launchable():
+            mig_config = skypilot_config.get_effective_region_config(
+                cloud='gcp',
+                region=region.name,
+                keys=('managed_instance_group',),
+                default_value=None,
+                override_configs=to_provision.cluster_config_overrides)
+            if mig_config is None:
+                continue
+            assert region.zones is not None and region.zones, region
+            zone = region.zones[0].name
+            if (region.name == to_provision.region and
+                    to_provision.zone is not None):
+                zone = to_provision.zone
+            candidate = unrestricted.copy(region=region.name, zone=zone)
+            if any(
+                    candidate.should_be_blocked_by(blocked)
+                    for blocked in self._blocked_resources):
+                continue
+            candidates.append(candidate)
+        candidates.sort(
+            key=lambda candidate: candidate.region != to_provision.region)
+        return candidates
+
+    @staticmethod
+    def _cleanup_tpu_flex_start_candidate(config_dict: Dict[str, Any]) -> None:
+        handle = config_dict['handle']
+        config = global_user_state.get_cluster_yaml_dict(handle.cluster_yaml)
+        provisioner.teardown_cluster(repr(handle.launched_resources.cloud),
+                                     resources_utils.ClusterName(
+                                         handle.cluster_name,
+                                         handle.cluster_name_on_cloud),
+                                     terminate=True,
+                                     provider_config=config['provider'])
+        CloudVmRayBackend().post_teardown_cleanup(handle,
+                                                  terminate=True,
+                                                  remove_from_db=False,
+                                                  failover=True)
+
+    def _race_tpu_flex_start_regions(
+        self,
+        task: task_lib.Task,
+        to_provision: resources_lib.Resources,
+        num_nodes: int,
+        stream_logs: bool,
+        cluster_name: str,
+        cloud_user_identity: Optional[List[str]],
+    ) -> Optional[Dict[str, Any]]:
+        candidates = self._get_tpu_flex_start_region_candidates(
+            task, to_provision)
+        if len(candidates) < 2:
+            return None
+
+        regions = ', '.join(
+            typing.cast(str, candidate.region) for candidate in candidates)
+        logger.info(
+            'Launching TPU Flex-start requests in parallel across %d '
+            'regions: %s', len(candidates), regions)
+        cancel_event = threading.Event()
+        requested_resources = set(task.resources)
+        state_lock = threading.Lock()
+        state_recorded = False
+        provision_log_path = os.path.abspath(
+            os.path.join(self.log_dir, 'provision.log'))
+        os.makedirs(self.log_dir, exist_ok=True)
+        pathlib.Path(provision_log_path).touch()
+
+        def record_candidate_state(handle: 'CloudVmRayResourceHandle') -> None:
+            nonlocal state_recorded
+            with state_lock:
+                if state_recorded:
+                    return
+                state_handle = CloudVmRayResourceHandle(
+                    cluster_name=cluster_name,
+                    cluster_name_on_cloud=handle.cluster_name_on_cloud,
+                    cluster_yaml=handle.cluster_yaml,
+                    launched_nodes=handle.launched_nodes,
+                    launched_resources=handle.launched_resources,
+                    stable_internal_external_ips=(
+                        handle.stable_internal_external_ips),
+                    stable_ssh_ports=handle.stable_ssh_ports,
+                    cluster_info=handle.cached_cluster_info)
+                self._record_cluster_provisioning_state(
+                    cluster_name, state_handle, requested_resources,
+                    provision_log_path, task, cloud_user_identity)
+                state_recorded = True
+
+        def provision_candidate(
+                candidate: resources_lib.Resources) -> Dict[str, Any]:
+            assert candidate.region is not None
+            candidate_name = f'{cluster_name}-mr-{candidate.region}'
+            candidate_log_dir = os.path.join(self.log_dir, 'regions',
+                                             candidate.region)
+            candidate_provisioner = RetryingVmProvisioner(
+                candidate_log_dir,
+                self._dag,
+                self._optimize_target,
+                self._requested_features,
+                self._local_wheel_path,
+                self._wheel_hash,
+                is_managed=self._is_managed,
+                extra_launch_context=self._extra_launch_context,
+                is_launched_by_jobs_controller=(
+                    self._is_launched_by_jobs_controller))
+            # pylint: disable=protected-access
+            config_dict = candidate_provisioner._retry_zones(
+                candidate,
+                num_nodes,
+                requested_resources=requested_resources,
+                dryrun=False,
+                stream_logs=stream_logs,
+                cluster_name=candidate_name,
+                cloud_user_identity=cloud_user_identity,
+                prev_cluster_status=None,
+                prev_handle=None,
+                prev_cluster_ever_up=False,
+                skip_if_config_hash_matches=None,
+                volume_mounts=task.volume_mounts,
+                task=task,
+                record_cluster_state=False,
+                cancel_event=cancel_event,
+                on_cluster_config_created=record_candidate_state)
+            config_dict['_provision_log_path'] = os.path.abspath(
+                os.path.join(candidate_log_dir, 'provision.log'))
+            return config_dict
+
+        winner = None
+        winner_candidate = None
+        candidate_errors: Dict[resources_lib.Resources, Exception] = {}
+        cleanup_errors: List[Exception] = []
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(candidates))
+        futures = {
+            executor.submit(contextvars.copy_context().run, provision_candidate,
+                            candidate): candidate for candidate in candidates
+        }
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                candidate = futures[future]
+                try:
+                    config_dict = future.result()
+                except Exception as e:  # pylint: disable=broad-except
+                    candidate_errors[candidate] = e
+                    if isinstance(e, provision_common.StopFailoverError):
+                        cleanup_errors.append(e)
+                        cancel_event.set()
+                    continue
+                if winner is None:
+                    winner = config_dict
+                    winner_candidate = candidate
+                    cancel_event.set()
+                    logger.info(
+                        'TPU Flex-start capacity acquired in %s; '
+                        'cancelling all other regions.', candidate.region)
+                else:
+                    try:
+                        self._cleanup_tpu_flex_start_candidate(config_dict)
+                    except Exception as e:  # pylint: disable=broad-except
+                        cleanup_errors.append(e)
+        finally:
+            cancel_event.set()
+            executor.shutdown(wait=True)
+
+        if cleanup_errors:
+            if winner is not None:
+                try:
+                    self._cleanup_tpu_flex_start_candidate(winner)
+                except Exception as e:  # pylint: disable=broad-except
+                    cleanup_errors.append(e)
+            details = '; '.join(
+                common_utils.format_exception(error)
+                for error in cleanup_errors)
+            raise provision_common.StopFailoverError(
+                'Failed to clean up one or more TPU Flex-start region '
+                f'candidates: {details}')
+
+        if winner is None:
+            for candidate in candidates:
+                _add_to_blocked_resources(self._blocked_resources, candidate)
+            blocks = _format_provision_failure_blocks(candidate_errors)
+            raise exceptions.ResourcesUnavailableError(
+                'All parallel TPU Flex-start region requests failed.\n' +
+                blocks)
+
+        assert winner_candidate is not None
+        handle = winner['handle']
+        handle.cluster_name = cluster_name
+        winner['cluster_name'] = cluster_name
+        self._record_cluster_provisioning_state(cluster_name, handle,
+                                                requested_resources,
+                                                winner['_provision_log_path'],
+                                                task, cloud_user_identity)
+        global_user_state.add_cluster_event(
+            cluster_name, status_lib.ClusterStatus.INIT,
+            f'TPU Flex-start capacity acquired in {winner_candidate.region}; '
+            'other regional requests cleaned up.',
+            global_user_state.ClusterEventType.STATUS_CHANGE)
+        return winner
+
     def _retry_zones(  # pylint: disable=line-too-long
         self,
         to_provision: resources_lib.Resources,
@@ -1052,6 +1304,10 @@ class RetryingVmProvisioner(object):
         skip_if_config_hash_matches: Optional[str],
         volume_mounts: Optional[List[volume_lib.VolumeMount]],
         task: task_lib.Task,
+        record_cluster_state: bool = True,
+        cancel_event: Optional[threading.Event] = None,
+        on_cluster_config_created: Optional[Callable[
+            ['CloudVmRayResourceHandle'], None]] = None,
     ) -> Dict[str, Any]:
         """The provision retry loop.
 
@@ -1071,12 +1327,13 @@ class RetryingVmProvisioner(object):
         log_abs_path = os.path.abspath(log_path)
         if not dryrun:
             os.makedirs(os.path.expanduser(self.log_dir), exist_ok=True)
-            os.system(f'touch {log_path}')
+            pathlib.Path(log_path).touch()
 
-        rich_utils.force_update_status(
-            ux_utils.spinner_message('Launching',
-                                     log_path,
-                                     cluster_name=cluster_name))
+        if record_cluster_state:
+            rich_utils.force_update_status(
+                ux_utils.spinner_message('Launching',
+                                         log_path,
+                                         cluster_name=cluster_name))
 
         # Get previous cluster status
         cluster_exists = prev_cluster_status is not None
@@ -1267,35 +1524,12 @@ class RetryingVmProvisioner(object):
                     stable_ssh_ports=prev_ssh_ports,
                     cluster_info=prev_cluster_info,
                 )
-                usage_lib.messages.usage.update_final_cluster_status(
-                    status_lib.ClusterStatus.INIT)
-
-                # Capture the task YAML.
-                user_specified_task_config = None
-                if task is not None:
-                    user_specified_task_config = task.to_yaml_config(
-                        use_user_specified_yaml=True)
-
-                # This sets the status to INIT (even for a normal, UP cluster).
-                global_user_state.add_or_update_cluster(
-                    cluster_name,
-                    cluster_handle=handle,
-                    requested_resources=requested_resources,
-                    ready=False,
-                    is_managed=self._is_managed,
-                    provision_log_path=log_abs_path,
-                    task_config=user_specified_task_config,
-                )
-
-                # Add cluster event for actual provisioning start.
-                global_user_state.add_cluster_event(
-                    cluster_name, status_lib.ClusterStatus.INIT,
-                    f'Provisioning on {to_provision.cloud.display_name()} ' +
-                    f'in {to_provision.region}',
-                    global_user_state.ClusterEventType.STATUS_CHANGE)
-
-                global_user_state.set_owner_identity_for_cluster(
-                    cluster_name, cloud_user_identity)
+                if record_cluster_state:
+                    self._record_cluster_provisioning_state(
+                        cluster_name, handle, requested_resources, log_abs_path,
+                        task, cloud_user_identity)
+                if on_cluster_config_created is not None:
+                    on_cluster_config_created(handle)
 
                 if (to_provision.cloud.PROVISIONER_VERSION ==
                         clouds.ProvisionerVersion.SKYPILOT):
@@ -1350,7 +1584,9 @@ class RetryingVmProvisioner(object):
                             cluster_yaml=handle.cluster_yaml,
                             prev_cluster_ever_up=prev_cluster_ever_up,
                             log_dir=self.log_dir,
-                            ports_to_open_on_launch=ports_to_open_on_launch)
+                            ports_to_open_on_launch=ports_to_open_on_launch,
+                            cancel_event=cancel_event,
+                            record_cluster_event=record_cluster_state)
                         # NOTE: We will handle the logic of '_ensure_cluster_ray_started'
                         # in 'provision_utils.post_provision_runtime_setup()' in the
                         # caller.
@@ -1374,6 +1610,13 @@ class RetryingVmProvisioner(object):
                     except exceptions.ExecutionPausedError:
                         # Pausing to wait on an external condition: keep the
                         # resources for resume, do not tear down or fail over.
+                        raise
+                    except provision_common.ProvisionCancelledError:
+                        CloudVmRayBackend().post_teardown_cleanup(
+                            handle,
+                            terminate=True,
+                            remove_from_db=False,
+                            failover=True)
                         raise
                     except config_lib.KubernetesError as e:
                         if e.insufficent_resources:
@@ -1871,21 +2114,27 @@ class RetryingVmProvisioner(object):
                 to_provision.cloud.check_features_are_supported(
                     to_provision, requested_features)
 
-                config_dict = self._retry_zones(
-                    to_provision,
-                    num_nodes,
-                    requested_resources=set(task.resources),
-                    dryrun=dryrun,
-                    stream_logs=stream_logs,
-                    cluster_name=cluster_name,
-                    cloud_user_identity=cloud_user,
-                    prev_cluster_status=prev_cluster_status,
-                    prev_handle=prev_handle,
-                    prev_cluster_ever_up=prev_cluster_ever_up,
-                    skip_if_config_hash_matches=skip_if_config_hash_matches,
-                    volume_mounts=task.volume_mounts,
-                    task=task,
-                )
+                config_dict = None
+                if prev_cluster_status is None and not dryrun:
+                    config_dict = self._race_tpu_flex_start_regions(
+                        task, to_provision, num_nodes, stream_logs,
+                        cluster_name, cloud_user)
+                if config_dict is None:
+                    config_dict = self._retry_zones(
+                        to_provision,
+                        num_nodes,
+                        requested_resources=set(task.resources),
+                        dryrun=dryrun,
+                        stream_logs=stream_logs,
+                        cluster_name=cluster_name,
+                        cloud_user_identity=cloud_user,
+                        prev_cluster_status=prev_cluster_status,
+                        prev_handle=prev_handle,
+                        prev_cluster_ever_up=prev_cluster_ever_up,
+                        skip_if_config_hash_matches=skip_if_config_hash_matches,
+                        volume_mounts=task.volume_mounts,
+                        task=task,
+                    )
                 if dryrun:
                     return config_dict
             except (exceptions.InvalidClusterNameError,

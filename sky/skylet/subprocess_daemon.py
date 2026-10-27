@@ -109,6 +109,15 @@ def kill_process_tree(process: psutil.Process,
     return True
 
 
+def is_process_running(process: psutil.Process) -> bool:
+    """Returns whether a process is alive and able to make progress."""
+    try:
+        return (process.is_running() and
+                process.status() != psutil.STATUS_ZOMBIE)
+    except psutil.NoSuchProcess:
+        return False
+
+
 def main():
     daemonize()
 
@@ -162,7 +171,8 @@ def main():
 
     if process is not None and parent_process is not None:
         # Wait for either parent or target process to exit
-        while process.is_running() and parent_process.is_running():
+        while (is_process_running(process) and
+               is_process_running(parent_process)):
             if pgid is None:
                 # Refresh process tree for cleanup if process group is not
                 # available.

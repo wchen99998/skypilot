@@ -355,6 +355,12 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
             )
 
     if to_start_count > 0:
+        create_kwargs = {}
+        if (resource is instance_utils.GCPManagedInstanceGroup and
+                mig_utils.is_tpu_managed_instance_group(config.node_config)):
+            cancel_event = config.provider_config.get('_provision_cancel_event')
+            if cancel_event is not None:
+                create_kwargs['cancel_event'] = cancel_event
         errors, created_instance_ids = resource.create_instances(
             cluster_name_on_cloud,
             project_id,
@@ -363,7 +369,8 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
             labels,
             to_start_count,
             total_count=config.count,
-            include_head_node=head_instance_id is None)
+            include_head_node=head_instance_id is None,
+            **create_kwargs)
         if errors:
             error = common.ProvisionerError('Failed to launch instances.')
             error.errors = errors

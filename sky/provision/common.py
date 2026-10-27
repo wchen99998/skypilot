@@ -44,6 +44,10 @@ class StopFailoverError(Exception):
     """
 
 
+class ProvisionCancelledError(Exception):
+    """Raised when a concurrent provisioning attempt loses its race."""
+
+
 # These fields are sensitive and should be redacted from the config for logging
 # purposes.
 SENSITIVE_FIELDS: List[Tuple[str, ...]] = [

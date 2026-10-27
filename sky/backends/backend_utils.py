@@ -214,6 +214,11 @@ _RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS = [
     # Other clouds
     ('provider', 'docker_login_config'),
     ('provider', 'firewall_rule'),
+    # A GCP network set in the SkyPilot config after the cluster was first
+    # launched must still apply on restart; without it the provisioner looks
+    # for (or tries to create) a VPC with SkyPilot-managed firewall rules.
+    ('provider', 'vpc_name'),
+    ('provider', 'subnet_names'),
     # TPU node launched before #2943 does not have the `provider.tpu_node` set,
     # and our latest code need this field to be set to distinguish the node, so
     # we need to take this field from the new yaml.

@@ -155,6 +155,17 @@ def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
             f'OS Login is enabled for GCP project {project_id}. Running '
             'additional authentication steps.')
 
+        # Add ssh key to GCP with oslogin. This comes first: a principal that
+        # has never imported a key (e.g. the jobs controller's service account)
+        # has no POSIX account, so its os-login profile carries no username
+        # yet.
+        subprocess.run(
+            'gcloud compute os-login ssh-keys add '
+            f'--key-file={public_key_path}',
+            check=True,
+            shell=True,
+            stdout=subprocess.DEVNULL)
+
         # Try to get the os-login user from `gcloud`, as this is the most
         # accurate way to figure out how this gcp user is meant to log in.
         proc = subprocess.run(
@@ -196,13 +207,14 @@ def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
             os_login_username = account.replace('@', '_').replace('.', '_')
         config['auth']['ssh_user'] = os_login_username
 
-        # Add ssh key to GCP with oslogin
-        subprocess.run(
-            'gcloud compute os-login ssh-keys add '
-            f'--key-file={public_key_path}',
-            check=True,
-            shell=True,
-            stdout=subprocess.DEVNULL)
+        if (config['provider'].get('vpc_name') or
+                config['provider'].get('subnet_names')):
+            # A user-specified network is managed outside SkyPilot (its
+            # firewall decides who may reach port 22); never open port 22 to
+            # the internet on it.
+            logger.info('Custom GCP network configured; skipping the '
+                        'allow-ssh-ingress-from-iap firewall rule.')
+            return configure_ssh_info(config)
         # Enable ssh port for all the instances
         enable_ssh_cmd = ('gcloud compute firewall-rules create '
                           'allow-ssh-ingress-from-iap '

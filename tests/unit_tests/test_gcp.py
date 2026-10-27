@@ -1,5 +1,6 @@
 import copy
 import pathlib
+import threading
 from unittest.mock import ANY
 from unittest.mock import call
 from unittest.mock import MagicMock
@@ -400,6 +401,7 @@ def test_gcp_run_validates_full_tpu_mig_before_adoption(monkeypatch):
     old_members = [f'old-node-{index}' for index in range(4)]
     new_members = [f'new-node-{index}' for index in range(4)]
     state = {'phase': 'old'}
+    cancel_event = threading.Event()
 
     instance_template, workload_policy, managed_instance_group = (
         _matching_tpu_mig_resources())
@@ -486,6 +488,7 @@ def test_gcp_run_validates_full_tpu_mig_before_adoption(monkeypatch):
                 'availability_zone': 'us-east5-a',
                 'project_id': 'project',
                 'use_managed_instance_group': True,
+                '_provision_cancel_event': cancel_event,
             },
             authentication_config={},
             docker_config={},
@@ -508,6 +511,7 @@ def test_gcp_run_validates_full_tpu_mig_before_adoption(monkeypatch):
     cleanup.assert_called_once_with('project', 'us-east5', 'cluster')
     create.assert_called_once()
     assert create.call_args.args[5] == 4
+    assert create.call_args.kwargs['cancel_event'] is cancel_event
     assert record.head_instance_id == new_members[0]
     assert record.created_instance_ids == new_members
 
@@ -1299,6 +1303,24 @@ def test_gcp_tpu_mig_compute_api_waits_through_capacity_error(monkeypatch):
 
     assert execute.call_count == 2
     assert sleep_calls == [mig_utils._BULK_MIG_POLL_INTERVAL_SECONDS]
+
+
+def test_gcp_tpu_mig_wait_can_be_cancelled_before_polling(monkeypatch):
+    cancel_event = threading.Event()
+    cancel_event.set()
+    build = MagicMock()
+    monkeypatch.setattr(mig_utils.gcp, 'build', build)
+
+    with pytest.raises(common.ProvisionCancelledError,
+                       match='another region acquired capacity'):
+        mig_utils.wait_for_region_managed_group_to_be_stable(
+            'project',
+            'us-east5',
+            'mig',
+            timeout=86400,
+            cancel_event=cancel_event)
+
+    build.assert_not_called()
 
 
 def test_gcp_tpu_mig_compute_api_wait_timeout(monkeypatch):

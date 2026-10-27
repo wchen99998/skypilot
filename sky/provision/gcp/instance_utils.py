@@ -5,6 +5,7 @@ import functools
 from multiprocessing import pool
 import re
 import subprocess
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
@@ -1198,6 +1199,7 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
         count: int,
         total_count: int,
         include_head_node: bool,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Tuple[Optional[List], List[str]]:
         logger.debug(f'Creating cluster with MIG: {cluster_name!r}')
         config, labels = cls._prepare_instance_config(cluster_name, node_config,
@@ -1276,6 +1278,10 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
             potential_head_instances = list(instances.keys())
 
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise common.ProvisionCancelledError(
+                    f'TPU MIG provisioning in {region} was cancelled because '
+                    'another region acquired capacity.')
             if instance_template_exists:
                 if mig_exists:
                     logger.debug(
@@ -1300,6 +1306,10 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                     cluster_name, project_id, region, instance_template_name,
                     config)
                 cls.wait_for_operation(operation, project_id, region=region)
+            if cancel_event is not None and cancel_event.is_set():
+                raise common.ProvisionCancelledError(
+                    f'TPU MIG provisioning in {region} was cancelled because '
+                    'another region acquired capacity.')
             # create managed instance group
             instance_template_url = (
                 f'projects/{project_id}/regions/{region}/'
@@ -1313,6 +1323,10 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                         project_id, region, workload_policy_name,
                         accelerator_topology, accelerator_topology_mode)
                     cls.wait_for_operation(operation, project_id, region=region)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise common.ProvisionCancelledError(
+                        f'TPU MIG provisioning in {region} was cancelled '
+                        'because another region acquired capacity.')
                 if not mig_exists:
                     operation = mig_utils.create_region_managed_instance_group(
                         project_id,
@@ -1326,11 +1340,19 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                 provision_timeout = managed_instance_group_config.get(
                     'provision_timeout',
                     constants.DEFAULT_MANAGED_INSTANCE_GROUP_PROVISION_TIMEOUT)
+                wait_kwargs = {}
+                if cancel_event is not None:
+                    wait_kwargs['cancel_event'] = cancel_event
                 mig_utils.wait_for_region_managed_group_to_be_stable(
                     project_id,
                     region,
                     managed_instance_group_name,
-                    timeout=provision_timeout)
+                    timeout=provision_timeout,
+                    **wait_kwargs)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise common.ProvisionCancelledError(
+                        f'TPU MIG provisioning in {region} was cancelled '
+                        'because another region acquired capacity.')
                 managed_instance_names = (
                     mig_utils.list_managed_instance_group_instances(
                         project_id, zone, managed_instance_group_name))

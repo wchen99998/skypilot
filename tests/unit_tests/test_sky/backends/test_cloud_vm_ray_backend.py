@@ -2,6 +2,7 @@
 
 import multiprocessing
 import socket
+import threading
 import time
 from unittest.mock import call
 from unittest.mock import MagicMock
@@ -480,6 +481,167 @@ class TestCloudVmRayBackendGetGrpcChannel:
                             lambda self, *args, **kwargs: None)
         backend = cloud_vm_ray_backend.CloudVmRayBackend()
         assert backend._get_num_gpus(test_task) == 8
+
+
+class TestTpuFlexStartMultiRegionProvisioning:
+    """Tests parallel TPU MIG DWS Flex-start region provisioning."""
+
+    @staticmethod
+    def _provisioner():
+        provisioner = cloud_vm_ray_backend.RetryingVmProvisioner.__new__(
+            cloud_vm_ray_backend.RetryingVmProvisioner)
+        provisioner._blocked_resources = set()
+        provisioner.log_dir = '/tmp/sky-test-flex-start'
+        provisioner._dag = MagicMock()
+        provisioner._optimize_target = MagicMock()
+        provisioner._requested_features = set()
+        provisioner._local_wheel_path = MagicMock()
+        provisioner._wheel_hash = 'wheel-hash'
+        provisioner._is_managed = False
+        provisioner._extra_launch_context = {}
+        provisioner._is_launched_by_jobs_controller = False
+        return provisioner
+
+    @staticmethod
+    def _resources(region=None, zone=None):
+        return resources.Resources(cloud=clouds.GCP(),
+                                   instance_type='ct6e-standard-4t',
+                                   region=region,
+                                   zone=zone,
+                                   _cluster_config_overrides={
+                                       'gcp': {
+                                           'managed_instance_group': {
+                                               'run_duration': 3600,
+                                               'accelerator_topology': '4x4',
+                                           }
+                                       }
+                                   })
+
+    def test_candidates_span_regions_only_for_unpinned_flex_start(self):
+        provisioner = self._provisioner()
+        requested = self._resources()
+        launch_task = task.Task(resources=requested, num_nodes=4)
+        selected = requested.copy(region='us-east5', zone='us-east5-b')
+        regions = [
+            clouds.Region('us-east5').set_zones([
+                clouds.Zone('us-east5-a'),
+                clouds.Zone('us-east5-b'),
+            ]),
+            clouds.Region('us-central1').set_zones(
+                [clouds.Zone('us-central1-a')]),
+            clouds.Region('europe-west4').set_zones(
+                [clouds.Zone('europe-west4-a')]),
+        ]
+
+        with patch.object(resources.Resources,
+                          'get_valid_regions_for_launchable',
+                          return_value=regions), patch.object(
+                              cloud_vm_ray_backend.skypilot_config,
+                              'get_effective_region_config',
+                              return_value={'run_duration': 3600}):
+            candidates = provisioner._get_tpu_flex_start_region_candidates(
+                launch_task, selected)
+
+        assert [(candidate.region, candidate.zone) for candidate in candidates
+               ] == [
+                   ('us-east5', 'us-east5-b'),
+                   ('us-central1', 'us-central1-a'),
+                   ('europe-west4', 'europe-west4-a'),
+               ]
+
+        pinned_task = task.Task(resources=self._resources(region='us-east5',
+                                                          zone='us-east5-a'),
+                                num_nodes=4)
+        assert provisioner._get_tpu_flex_start_region_candidates(
+            pinned_task, selected) == []
+
+    def test_first_region_wins_and_late_success_is_cleaned_up(self):
+        provisioner = self._provisioner()
+        requested = self._resources()
+        launch_task = task.Task(resources=requested, num_nodes=4)
+        candidates = [
+            requested.copy(region='us-east5', zone='us-east5-a'),
+            requested.copy(region='europe-west4', zone='europe-west4-a'),
+        ]
+        started = threading.Barrier(len(candidates))
+        cancelled_regions = []
+        configs = {}
+
+        def retry_zones(self, candidate, *args, cancel_event, **kwargs):
+            del self, args
+            handle = MagicMock()
+            handle.cluster_name = f'test-mr-{candidate.region}'
+            handle.cluster_name_on_cloud = f'test-{candidate.region}'
+            handle.launched_resources = candidate
+            handle.cluster_yaml = f'/tmp/{candidate.region}.yml'
+            config = {'handle': handle, 'provisioning_skipped': False}
+            configs[candidate.region] = config
+            kwargs['on_cluster_config_created'](handle)
+            started.wait()
+            if candidate.region == 'us-east5':
+                return config
+            assert cancel_event.wait(timeout=2)
+            cancelled_regions.append(candidate.region)
+            return config
+
+        with patch.object(
+                provisioner,
+                '_get_tpu_flex_start_region_candidates',
+                return_value=candidates), patch.object(
+                    cloud_vm_ray_backend.RetryingVmProvisioner,
+                    '_retry_zones',
+                    autospec=True,
+                    side_effect=retry_zones), patch.object(
+                        provisioner,
+                        '_cleanup_tpu_flex_start_candidate') as cleanup, \
+             patch.object(
+                 provisioner,
+                 '_record_cluster_provisioning_state') as record_state, \
+             patch.object(cloud_vm_ray_backend.global_user_state,
+                          'add_cluster_event'):
+            result = provisioner._race_tpu_flex_start_regions(
+                launch_task, candidates[0], 4, False, 'test', ['user'])
+
+        assert result is not None
+        assert result['handle'].cluster_name == 'test'
+        assert cancelled_regions == ['europe-west4']
+        cleanup.assert_called_once_with(configs['europe-west4'])
+        assert record_state.call_count == 2
+
+    def test_all_regions_fail_and_are_blocked(self):
+        provisioner = self._provisioner()
+        requested = self._resources()
+        launch_task = task.Task(resources=requested, num_nodes=4)
+        candidates = [
+            requested.copy(region='us-east5', zone='us-east5-a'),
+            requested.copy(region='europe-west4', zone='europe-west4-a'),
+        ]
+
+        with patch.object(provisioner,
+                          '_get_tpu_flex_start_region_candidates',
+                          return_value=candidates), patch.object(
+                              cloud_vm_ray_backend.RetryingVmProvisioner,
+                              '_retry_zones',
+                              autospec=True,
+                              side_effect=exceptions.ResourcesUnavailableError(
+                                  'no capacity')), patch.object(
+                                      provisioner,
+                                      '_record_cluster_provisioning_state'):
+            with pytest.raises(exceptions.ResourcesUnavailableError,
+                               match='All parallel TPU Flex-start'):
+                provisioner._race_tpu_flex_start_regions(
+                    launch_task, candidates[0], 4, False, 'test', ['user'])
+
+        assert provisioner._blocked_resources == set(candidates)
+
+    def test_spot_tpu_mig_is_not_treated_as_flex_start(self):
+        provisioner = self._provisioner()
+        requested = self._resources().copy(use_spot=True)
+        launch_task = task.Task(resources=requested, num_nodes=4)
+        selected = requested.copy(region='us-east5', zone='us-east5-a')
+
+        assert provisioner._get_tpu_flex_start_region_candidates(
+            launch_task, selected) == []
 
 
 class TestIsMessageTooLong:

@@ -3,12 +3,14 @@ import copy
 import hashlib
 import json
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 import uuid
 
 from sky import sky_logging
 from sky.adaptors import gcp
+from sky.provision import common
 from sky.provision.gcp import constants
 from sky.utils import annotations
 
@@ -1092,9 +1094,13 @@ def delete_region_managed_instance_group(project_id: str, region: str,
     return operation
 
 
-def _wait_for_managed_group_to_be_stable(project_id: str, location: str,
-                                         group_name: str, timeout: int,
-                                         regional: bool) -> None:
+def _wait_for_managed_group_to_be_stable(
+        project_id: str,
+        location: str,
+        group_name: str,
+        timeout: int,
+        regional: bool,
+        cancel_event: Optional[threading.Event] = None) -> None:
     if timeout <= 0:
         raise ValueError(f'MIG provision timeout must be positive; got '
                          f'{timeout}.')
@@ -1140,6 +1146,10 @@ def _wait_for_managed_group_to_be_stable(project_id: str, location: str,
     last_auth_refresh_warning = None
     last_auth_error = None
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise common.ProvisionCancelledError(
+                f'MIG provisioning in {location!r} was cancelled because '
+                'another region acquired capacity.')
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             if last_auth_error is not None:
@@ -1197,7 +1207,12 @@ def _wait_for_managed_group_to_be_stable(project_id: str, location: str,
             # by `gcloud auth application-default login` or credential
             # rotation in the API-server environment.
             managers = None
-            time.sleep(min(_GCP_AUTH_REFRESH_RETRY_INTERVAL_SECONDS, remaining))
+            retry_interval = min(_GCP_AUTH_REFRESH_RETRY_INTERVAL_SECONDS,
+                                 remaining)
+            if cancel_event is None:
+                time.sleep(retry_interval)
+            else:
+                cancel_event.wait(retry_interval)
             continue
         except gcp.http_error_exception() as e:
             status_code = getattr(getattr(e, 'resp', None), 'status', None)
@@ -1211,7 +1226,12 @@ def _wait_for_managed_group_to_be_stable(project_id: str, location: str,
             logger.warning(
                 'Transient GCP HTTP %s while waiting for MIG %r; retrying '
                 'within the provision timeout.', status_code, group_name)
-            time.sleep(min(_GCP_TRANSIENT_RETRY_INTERVAL_SECONDS, remaining))
+            retry_interval = min(_GCP_TRANSIENT_RETRY_INTERVAL_SECONDS,
+                                 remaining)
+            if cancel_event is None:
+                time.sleep(retry_interval)
+            else:
+                cancel_event.wait(retry_interval)
             continue
         except (gcp.auth_transport_error_exception(),
                 gcp.http_transport_error_exception(), OSError) as e:
@@ -1224,7 +1244,12 @@ def _wait_for_managed_group_to_be_stable(project_id: str, location: str,
                 'Transient GCP transport error while waiting for MIG %r: %s. '
                 'Retrying within the provision timeout.', group_name,
                 type(e).__name__)
-            time.sleep(min(_GCP_TRANSIENT_RETRY_INTERVAL_SECONDS, remaining))
+            retry_interval = min(_GCP_TRANSIENT_RETRY_INTERVAL_SECONDS,
+                                 remaining)
+            if cancel_event is None:
+                time.sleep(retry_interval)
+            else:
+                cancel_event.wait(retry_interval)
             continue
         if time.monotonic() >= deadline:
             # Even a successful HTTP request must not extend the caller's
@@ -1278,7 +1303,11 @@ def _wait_for_managed_group_to_be_stable(project_id: str, location: str,
                 f'{progress_errors}; instance status: {current_status}.')
         poll_interval = (_BULK_MIG_POLL_INTERVAL_SECONDS
                          if regional else constants.POLL_INTERVAL)
-        time.sleep(min(poll_interval, remaining))
+        sleep_seconds = min(poll_interval, remaining)
+        if cancel_event is None:
+            time.sleep(sleep_seconds)
+        else:
+            cancel_event.wait(sleep_seconds)
 
 
 def wait_for_managed_group_to_be_stable(project_id: str, zone: str,
@@ -1291,12 +1320,16 @@ def wait_for_managed_group_to_be_stable(project_id: str, zone: str,
                                          regional=False)
 
 
-def wait_for_region_managed_group_to_be_stable(project_id: str, region: str,
-                                               group_name: str,
-                                               timeout: int) -> None:
+def wait_for_region_managed_group_to_be_stable(
+        project_id: str,
+        region: str,
+        group_name: str,
+        timeout: int,
+        cancel_event: Optional[threading.Event] = None) -> None:
     """Wait until the regional managed instance group is stable."""
     _wait_for_managed_group_to_be_stable(project_id,
                                          region,
                                          group_name,
                                          timeout,
-                                         regional=True)
+                                         regional=True,
+                                         cancel_event=cancel_event)
